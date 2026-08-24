@@ -152,6 +152,16 @@ class TooLarge(Exception):
     """The request exceeded the per-minute token allowance even when idle."""
 
 
+class Exhausted(Exception):
+    """This model has spent its allowance for the day, not just the minute."""
+
+
+def _reset_hint(msg: str) -> str:
+    """The 'try again in ...' Groq puts in a rate-limit message, if it is there."""
+    m = re.search(r"try again in ([\dhms.]+)", msg)
+    return f"resets in {m.group(1).rstrip('.')}" if m else "resets later today"
+
+
 # ------------------------------------------------------------ token budget ---
 def _parse_reset(value: str) -> float:
     """Groq formats these as '30.097s', '1m26.4s' or '2m'."""
@@ -187,6 +197,9 @@ class TokenBudget:
     """
 
     def __init__(self) -> None:
+        # Set to a human-readable reason once this model's daily allowance is
+        # gone, which no amount of waiting inside one job will recover.
+        self.exhausted: str = ""
         self.remaining: int | None = None
         self.reset_at = 0.0
         self.limit: int | None = None
@@ -366,6 +379,14 @@ def _call_inner(client, kwargs: dict, model: str, max_tokens: int,
                 continue
             if _is(e, 413):
                 raise TooLarge(msg) from e
+            # A per-DAY limit is not something a backoff can outwait: the
+            # window is hours, not seconds. Retrying it burns three quarters of
+            # a minute each time and leaves the stage frozen with no
+            # explanation, so this model is taken out of the pool instead and
+            # the others carry the work.
+            if _is(e, 429) and "per day" in msg.lower():
+                budget.exhausted = _reset_hint(msg)
+                raise Exhausted(f"{model}: {budget.exhausted}") from e
             if _is(e, 429, 503, 502) and attempt < 3:
                 wait = _parse_reset(
                     re.search(r"try again in ([\dhms.]+)", msg).group(1)
@@ -532,6 +553,36 @@ def build_glossary(client, segments: list[dict], model: str, src: str) -> str:
     return cast
 
 
+def build_system(src: str, glossary: str = "") -> str:
+    """The full translator brief: rules, language notes and the cast list."""
+    system = SYSTEM.format(src_name=LANG_NAMES.get(src, "the source language"))
+    if PRONOUN_NOTES.get(src):
+        system += "\n\nABOUT THIS LANGUAGE. " + PRONOUN_NOTES[src]
+    if glossary:
+        system += ("\n\nCAST LIST. Use these spellings exactly, and these "
+                   "genders when choosing English pronouns - they outrank "
+                   "the pronouns in the transcript:\n" + glossary)
+    return system
+
+
+def cast_list(client, segments: list[dict], model: str, src: str,
+              cache_dir: Path | None = None) -> str:
+    """The cast list for a transcript, read from cache when one was made."""
+    cache = (cache_dir / "glossary.txt") if cache_dir else None
+    if cache is not None and cache.is_file():
+        try:
+            return cache.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    glossary = build_glossary(client, segments, model, src)
+    if cache is not None and glossary:
+        try:
+            cache.write_text(glossary, encoding="utf-8")
+        except OSError:
+            pass
+    return glossary
+
+
 def _worker(client, model: str, system: str, segments: list[dict],
             jobs: list, lock, state: dict, budget: TokenBudget) -> None:
     """Drain the shared job list using one model, paced by a shared budget.
@@ -575,6 +626,12 @@ def _worker(client, model: str, system: str, segments: list[dict],
 
         try:
             result = _run_batch(client, model, system, segments, lo, hi, budget)
+        except Exhausted:
+            # This model has no allowance left today. Give the batch back so a
+            # model that still has budget picks it up, and stop this stream.
+            with lock:
+                jobs.insert(0, (lo, hi))
+            return
         except TooLarge:
             if hi - lo > 1:
                 mid = lo + (hi - lo) // 2
@@ -626,7 +683,10 @@ def _worker(client, model: str, system: str, segments: list[dict],
 def translate(client, segments: list[dict], model: str, src: str,
               progress=None, models: list[str] | None = None,
               clients: list | None = None, checkpoint=None,
-              cache_dir: Path | None = None) -> list[dict]:
+              cache_dir: Path | None = None,
+              window: tuple[int, int] | None = None,
+              system: str | None = None,
+              budgets: dict | None = None) -> list[dict]:
     """Translate every line, spread over every model and key available.
 
     Three things multiply here, and they are independent:
@@ -646,17 +706,32 @@ def translate(client, segments: list[dict], model: str, src: str,
     pool_models = [model] + [m for m in (models or []) if m and m != model]
     total = len(segments)
 
+    # `window` restricts which lines get translated without hiding the rest:
+    # the full transcript stays available so each batch still sees the lines
+    # either side of it for continuity. Used by the streaming pipeline, which
+    # translates a few minutes at a time so playback can start early.
+    first, last = window if window else (0, total)
+    # Batches sit on one grid across the whole transcript, not one per window.
+    # A window boundary almost never lands on a multiple of BATCH, so cutting
+    # batches at it would leave a stub - a two-line request paying the same
+    # ~1900 token system prompt as a thirty-line one. Snapping outwards instead
+    # means a window translates a few lines past its own end, which the next
+    # window then finds already done: measured on a 54 minute episode, 48
+    # requests either way instead of 55, and the daily request allowance is
+    # what runs out first.
+    first = (first // BATCH) * BATCH
+    last = min(total, -(-last // BATCH) * BATCH)
     # Batch-level granularity: a batch is translated all at once, so a batch
     # with every line already filled in is one that finished last time.
-    jobs = [(lo, min(lo + BATCH, total)) for lo in range(0, total, BATCH)]
+    jobs = [(lo, min(lo + BATCH, last)) for lo in range(first, last, BATCH)]
     jobs = [(lo, hi) for lo, hi in jobs
             if not all(segments[i].get("en", "").strip() for i in range(lo, hi))]
     if not jobs:
         return segments
-    resumed = total - sum(hi - lo for lo, hi in jobs)
+    resumed = (last - first) - sum(hi - lo for lo, hi in jobs)
 
     glossary = ""
-    if total > BATCH:
+    if system is None and total > BATCH:
         # The cast list costs a request and is the same for every run over the
         # same transcript, so a retry reads it back instead of rebuilding it.
         cache = (cache_dir / "glossary.txt") if cache_dir else None
@@ -674,13 +749,11 @@ def translate(client, segments: list[dict], model: str, src: str,
                 except Exception:
                     pass
 
-    system = SYSTEM.format(src_name=LANG_NAMES.get(src, "the source language"))
-    if PRONOUN_NOTES.get(src):
-        system += "\n\nABOUT THIS LANGUAGE. " + PRONOUN_NOTES[src]
-    if glossary:
-        system += ("\n\nCAST LIST. Use these spellings exactly, and these "
-                   "genders when choosing English pronouns - they outrank "
-                   "the pronouns in the transcript:\n" + glossary)
+    # The streaming pipeline builds this once and hands it to every window, so
+    # the cast list is settled before the first line is translated and stays
+    # identical for the whole video.
+    if system is None:
+        system = build_system(src, glossary)
 
     lock = threading.Lock()
     state = {"done": resumed, "error": None, "checkpoint": checkpoint}
@@ -694,16 +767,27 @@ def translate(client, segments: list[dict], model: str, src: str,
             if len(pool_clients) > 1:
                 bits.append(f"{len(pool_clients)} keys")
             note = f" on {' and '.join(bits)}" if bits else ""
-            progress(f"Translating line {min(d + 1, total)} of {total}{note}",
-                     45 + int(25 * d / max(1, total)))
+            span = last - first
+            progress(f"Translating line {min(d + 1, span)} of {span}{note}",
+                     45 + int(25 * d / max(1, span)))
 
     state["report"] = report
     report()
 
     # A bucket belongs to one (key, model) pair, so that is what gets its own
     # budget. Several streams then share each bucket to keep it busy.
-    budgets = {(ci, m): TokenBudget()
-               for ci in range(len(pool_clients)) for m in pool_models}
+    #
+    # The caller can hand these in to keep them alive across calls, and the
+    # streaming pipeline does. A budget only learns what is left by reading it
+    # off a reply, so a fresh one believes the whole allowance is available:
+    # start every window with new budgets and each one opens by firing every
+    # stream at once, blowing the per-minute limit and buying a rate-limit
+    # backoff that stalls playback for minutes.
+    if budgets is None:
+        budgets = {}
+    for ci in range(len(pool_clients)):
+        for m in pool_models:
+            budgets.setdefault((ci, m), TokenBudget())
     streams = [(ci, m) for ci in range(len(pool_clients)) for m in pool_models
                for _ in range(STREAMS_PER_MODEL)]
 
@@ -720,6 +804,20 @@ def translate(client, segments: list[dict], model: str, src: str,
 
     if state["error"]:
         raise state["error"]
+
+    # Every stream returned but work is left over: the models handed their
+    # batches back because they are out of allowance for the day. Say so
+    # plainly - the alternative is a video that quietly ends up half dubbed.
+    if jobs:
+        out = sorted({f"{m} ({b.exhausted})" for (_, m), b in budgets.items()
+                      if b.exhausted})
+        if out:
+            raise RuntimeError(
+                "Groq's daily token limit is used up on " + ", ".join(out)
+                + ". Translation stopped with "
+                + f"{sum(hi - lo for lo, hi in jobs)} lines still to do; "
+                "everything already translated is saved, so pick this up again "
+                "with Try again once the limit resets.")
     return segments
 
 

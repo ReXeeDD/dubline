@@ -109,6 +109,13 @@ def _row(r: sqlite3.Row) -> dict:
     except Exception:
         d["stats"] = {}
     folder = LIBRARY / d["id"]
+    # How much of the dub is watchable right now. Present while a video is
+    # still processing, which is the whole point of it.
+    try:
+        d["stream"] = json.loads(
+            (folder / "hls" / "ready.json").read_text(encoding="utf-8"))
+    except Exception:
+        d["stream"] = {}
     d["has_output"] = (folder / "dubbed.mp4").exists()
     d["has_thumb"] = (folder / "thumb.jpg").exists()
     d["has_source"] = any((folder / f"source{e}").exists()

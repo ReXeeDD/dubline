@@ -365,6 +365,144 @@ def build_dub_track(segments: list[dict], voice: str, workdir: Path,
     return out, stats
 
 
+class StreamMixer:
+    """Renders the dub a time window at a time, for live playback.
+
+    build_dub_track lays the whole video down in one pass over one big array.
+    That cannot start playing until it finishes, so this does the same work in
+    order, handing back exactly the samples covering each window as it goes.
+
+    The one thing it has to get right is the seam. A line that starts near the
+    end of a window carries on past it, and the samples that spill over are
+    kept and mixed into the front of the next window rather than being cut - a
+    dropped tail would be an audible click on every window boundary, and a
+    dropped *sample* would desync everything after it.
+    """
+
+    # Room beyond the window for a line that starts inside it and runs on. The
+    # longest a single dub line can run is its own slot plus the speed-up
+    # allowance, comfortably inside this.
+    TAIL_SECONDS = 30.0
+
+    def __init__(self, segments: list[dict], total_duration: float, voice: str,
+                 workdir: Path, max_speedup: float = 1.7, pitch: int = 0,
+                 speed: int = 0, volume: int = 0):
+        from . import voiceclone
+        self.segments = segments
+        self.total = total_duration
+        self.voice = voiceclone.base_voice_for(voice)
+        self.workdir = workdir
+        self.max_speedup = max_speedup
+        self.pitch, self.speed, self.volume = int(pitch), int(speed), int(volume)
+
+        # Slot widths depend on the following line, so they are worked out once
+        # over the whole transcript - not per window, where the last line would
+        # have no successor to measure against.
+        widths = _windows(segments, total_duration)
+        self.win_by_id = {s["id"]: w for s, w in zip(segments, widths)}
+
+        self.pos = 0.0                                    # start of next window
+        self.carry = np.zeros(0, dtype=np.float32)        # spill from last one
+        self.stats = {"lines": 0, "compressed": 0, "drift": 0.0, "failed": 0,
+                      "max_speedup_used": 1.0, "overlapped": 0}
+
+    def render(self, lo: int, hi: int, until: float, progress=None) -> np.ndarray:
+        """Speak segments[lo:hi] and return the audio covering [pos, until)."""
+        until = min(max(until, self.pos), self.total)
+        n = int(round((until - self.pos) * SR))
+        if n <= 0:
+            return np.zeros(0, dtype=np.float32)
+
+        spoken = [s for s in self.segments[lo:hi] if s.get("en", "").strip()]
+        results: dict[int, dict] = {}
+        if spoken:
+            results = asyncio.run(_render_all(
+                spoken, self.voice, self.workdir,
+                [self.win_by_id[s["id"]] for s in spoken],
+                self.max_speedup, progress, self.pitch, self.speed, self.volume))
+
+        plan = _plan(self.segments, results, self.total, self.max_speedup,
+                     lo, hi, self.stats)
+
+        buf = np.zeros(n + int(self.TAIL_SECONDS * SR), dtype=np.float32)
+        buf[:len(self.carry)] += self.carry[:len(buf)]
+
+        clips: dict[int, np.ndarray] = {}
+        if plan:
+            with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
+                futures = {pool.submit(decode_pcm, r["file"], tempo): seg["id"]
+                           for seg, r, tempo in plan}
+                for fut in as_completed(futures):
+                    try:
+                        clips[futures[fut]] = fut.result()
+                    except Exception:
+                        pass
+
+        for seg, r, tempo in plan:
+            clip = clips.get(seg["id"])
+            if clip is None:
+                self.stats["failed"] += 1
+                continue
+            clip = fade(clip)
+            place(buf, clip, seg["start"] - self.pos)     # offset within window
+            actual = len(clip) / SR
+            seg["dub_start"] = round(seg["start"], 3)
+            seg["dub_end"] = round(seg["start"] + actual, 3)
+            seg["dub_speedup"] = round(tempo * r.get("native_rate", 1.0), 3)
+            self.stats["lines"] += 1
+
+        out = buf[:n].copy()
+        self.carry = buf[n:]
+        self.pos = until
+        return out
+
+    # A line may run a little past the end of the video, and that much is worth
+    # keeping. Beyond it the carry buffer is only the unused scratch space, and
+    # feeding that to the stream would leave the audio longer than the picture.
+    OVERRUN_LIMIT = 1.0
+
+    def drain(self) -> np.ndarray:
+        """The last line's tail, if it runs past the end of the final window."""
+        tail, self.carry = self.carry, np.zeros(0, dtype=np.float32)
+        tail = tail[:int(self.OVERRUN_LIMIT * SR)]
+        voiced = np.nonzero(np.abs(tail) > 1e-5)[0]
+        return tail[:int(voiced[-1]) + 1] if voiced.size else tail[:0]
+
+
+def _plan(segments: list[dict], results: dict, total_duration: float,
+          max_speedup: float, lo: int, hi: int, stats: dict) -> list:
+    """Decide how fast each rendered line has to be spoken to fit its gap.
+
+    Shared by the one-pass and the streaming assembler so both make exactly the
+    same timing decisions - a line must not land differently depending on which
+    of the two produced it.
+    """
+    plan = []
+    for i in range(lo, hi):
+        seg = segments[i]
+        r = results.get(seg["id"])
+        if not r or not r.get("file"):
+            continue
+        nxt = segments[i + 1]["start"] if i + 1 < len(segments) else total_duration
+
+        want = breath_after(seg.get("en", "")) if i + 1 < len(segments) else MIN_GAP
+        room = nxt - seg["start"]
+        gap = max(0.30, room - want)
+        if r["duration"] / max(gap, 1e-6) > BREATH_TEMPO_LIMIT:
+            relaxed = max(MIN_GAP, r["duration"] / BREATH_TEMPO_LIMIT)
+            gap = max(0.30, min(room - MIN_GAP, relaxed))
+        tempo = r["duration"] / gap if gap > 0 else 1.0
+        ceiling = max(1.0, min(HARD_TEMPO_CEIL,
+                               max_speedup / r.get("native_rate", 1.0)))
+        tempo = min(max(1.0, tempo), ceiling)
+        if tempo > 1.01:
+            stats["compressed"] += 1
+        stats["max_speedup_used"] = max(
+            stats["max_speedup_used"], round(tempo * r.get("native_rate", 1.0), 3))
+        plan.append((seg, r, tempo))
+    return plan
+
+
 def preview(text: str, voice: str, dst: Path, pitch: int = 0,
             rate_pct: int = 0, volume: int = 0) -> Path:
     """Render a sample line. A cloned voice renders as its base voice here -

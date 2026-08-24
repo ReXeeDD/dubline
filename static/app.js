@@ -766,8 +766,18 @@ function card(v) {
       ${busy ? `<div class="progress-wrap">
           <div class="bar${v.progress ? '' : ' indeterminate'}"><i style="width:${v.progress || 0}%"></i></div>
           <div class="stage">${esc(v.stage || '')}${v.progress ? ` &middot; ${v.progress}%` : ''}</div>
+          <div class="live-row">${liveButton(v)}</div>
         </div>` : ''}
     </div>`;
+}
+
+/* Watching starts as soon as the first window of dub is published, so a long
+   video does not have to be finished before it can be played. */
+function liveButton(v) {
+  const s = (v.stream && v.stream.seconds) || 0;
+  if (s < 5) return '';
+  return `<a class="btn live" href="#/watch/${v.id}">
+      <span class="dot"></span>Watch now &middot; ${hhmmss(s)} ready</a>`;
 }
 
 async function renderHome() {
@@ -892,7 +902,10 @@ async function renderWatch(id) {
   catch (e) { view.innerHTML = `<div class="empty"><h3>${esc(e.message)}</h3>
     <a class="btn ghost" href="#/">Back to library</a></div>`; return; }
 
-  if (v.status !== 'ready') { location.hash = '#/'; return; }
+  // A video still being dubbed is watchable as soon as it has published a
+  // stream; only one with nothing to play yet goes back to the library.
+  const live = v.status !== 'ready';
+  if (live && !((v.stream && v.stream.seconds) > 0)) { location.hash = '#/'; return; }
 
   const segs = v.segments || [];
   const st = v.stats || {};
@@ -901,18 +914,25 @@ async function renderWatch(id) {
     <div class="watch">
       <div>
         <div class="player-wrap">
-          <video id="player" controls preload="metadata" src="/media/${id}/video?t=${v.updated_at}">
-            <track id="tr-en" kind="subtitles" srclang="en" label="English"
+          <video id="player" controls preload="metadata"
+                 ${live ? '' : `src="/media/${id}/video?t=${v.updated_at}"`}>
+            ${live ? '' : `<track id="tr-en" kind="subtitles" srclang="en" label="English"
                    src="/media/${id}/english.vtt?t=${v.updated_at}" default>
             <track id="tr-src" kind="subtitles" srclang="${esc(v.source_lang || 'zh')}" label="Original"
-                   src="/media/${id}/original.vtt?t=${v.updated_at}">
+                   src="/media/${id}/original.vtt?t=${v.updated_at}">`}
           </video>
         </div>
+        ${live ? `<div class="livebar" id="livebar">
+            <span class="dot"></span>
+            <b id="live-stage">${esc(v.stage || 'Dubbing')}</b>
+            <span class="live-ready" id="live-ready"></span>
+            <div class="live-track"><i id="live-fill"></i></div>
+          </div>` : ''}
 
         <h1>${esc(v.title)}</h1>
 
         <div class="toolbar">
-          <div class="pill-group" id="audio-toggle">
+          ${live ? '' : `<div class="pill-group" id="audio-toggle">
             <button data-src="0" class="on">English dub</button>
             <button data-src="1">Original audio</button>
           </div>
@@ -920,11 +940,11 @@ async function renderWatch(id) {
             <button data-sub="en" class="on">English subs</button>
             <button data-sub="src">Original subs</button>
             <button data-sub="off">Off</button>
-          </div>
+          </div>`}
           <span class="sep"></span>
-          <button class="btn ghost" id="btn-revoice">Voice &amp; audio</button>
+          ${live ? '' : `<button class="btn ghost" id="btn-revoice">Voice &amp; audio</button>
           <a class="btn ghost" href="/media/${id}/video" download="${esc(v.title)}.mp4">Download</a>
-          <button class="btn icon ghost" id="btn-more" title="Options">&#8942;</button>
+          <button class="btn icon ghost" id="btn-more" title="Options">&#8942;</button>`}
         </div>
 
         <div class="statgrid">
@@ -933,7 +953,7 @@ async function renderWatch(id) {
           <div><span>Voice</span><b>${esc((v.voice || '').split('-').pop().replace('Neural', '') || '-')}</b></div>
           <div><span>Sped up to fit</span><b>${st.compressed ?? 0} lines</b></div>
           <div><span>Peak rate</span><b>${st.max_speedup_used ? st.max_speedup_used + 'x' : '1x'}</b></div>
-          <div><span>Max drift</span><b>${(st.drift ?? 0).toFixed ? (st.drift).toFixed(2) : st.drift}s</b></div>
+          <div><span>Max drift</span><b>${(+(st.drift ?? 0)).toFixed(2)}s</b></div>
         </div>
         ${st.failed ? `<div class="alert">${st.failed} line(s) could not be voiced and are silent.</div>` : ''}
       </div>
@@ -960,6 +980,19 @@ async function renderWatch(id) {
   const player = document.getElementById('player');
   const linesBox = document.getElementById('lines');
 
+  if (live) startLive(id, player, v);
+
+  // Coming back from the live view when the dub finished: carry the viewer's
+  // position across so the switch to the finished file is not a restart.
+  if (!live && RESUME && RESUME.id === id) {
+    const { at, playing } = RESUME;
+    RESUME = null;
+    player.addEventListener('loadedmetadata', () => {
+      player.currentTime = at;
+      if (playing) player.play().catch(() => {});
+    }, { once: true });
+  }
+
   /* subtitle toggle */
   const setSubs = (which) => {
     const tracks = player.textTracks;
@@ -976,7 +1009,7 @@ async function renderWatch(id) {
       setSubs(b.dataset.sub);
     };
   });
-  player.addEventListener('loadedmetadata', () => setSubs(
+  if (!live) player.addEventListener('loadedmetadata', () => setSubs(
     view.querySelector('#sub-toggle .on').dataset.sub), { once: true });
 
   /* audio source toggle - keeps position and play state */
@@ -1064,7 +1097,8 @@ async function renderWatch(id) {
   };
 
   /* voice change */
-  document.getElementById('btn-revoice').onclick = async () => {
+  const revoiceBtn = document.getElementById('btn-revoice');
+  if (revoiceBtn) revoiceBtn.onclick = async () => {
     await loadVoices();
     const cfg = await api('/api/settings').catch(() => ({}));
     const bgOn = v.stats?.keep_original_audio ?? cfg.keep_original_audio ?? false;
@@ -1145,12 +1179,85 @@ async function renderWatch(id) {
     });
   };
 
-  document.getElementById('btn-more').onclick = () => cardMenu(id);
+  const moreBtn = document.getElementById('btn-more');
+  if (moreBtn) moreBtn.onclick = () => cardMenu(id);
 }
+
+/* ---------------------------------------------------------- live watch --- */
+/* The dub is served as HLS while it is still being made. The picture is whole
+   from the start, so seeking anywhere works; the audio playlist grows, and
+   hls.js picks up new segments each time it reloads the playlist. */
+function startLive(id, player, v) {
+  const url = `/api/videos/${id}/stream/master.m3u8`;
+  FINISHED = false;
+
+  if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls({
+      // The playlist is still being written, so a 404 on a segment the player
+      // guessed at is normal rather than fatal - keep retrying instead.
+      manifestLoadingMaxRetry: 20,
+      levelLoadingMaxRetry: 20,
+      fragLoadingMaxRetry: 20,
+      // Both playlists are open-ended while dubbing, which makes this look
+      // like a live stream. It is not: the viewer wants the beginning, not
+      // whatever was encoded a moment ago.
+      startPosition: 0,
+      liveDurationInfinity: false,
+      lowLatencyMode: false,
+    });
+    hls.loadSource(url);
+    hls.attachMedia(player);
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return;
+      // The stream is torn down the moment the dub finishes, so a fatal
+      // network error here usually just means the finished file is ready.
+      if (FINISHED) { render(); return; }
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+    });
+    player.__hls = hls;
+  } else {
+    player.src = url;      // Safari plays HLS natively
+  }
+
+  const fill = document.getElementById('live-fill');
+  const readyEl = document.getElementById('live-ready');
+  const stageEl = document.getElementById('live-stage');
+
+  const tick = async () => {
+    const s = await api(`/api/videos/${id}/status`).catch(() => null);
+    if (!s) return;
+    const st = s.stream || {};
+    const total = st.duration || v.duration || 0;
+    const done = st.seconds || 0;
+    if (fill && total) fill.style.width = Math.min(100, (100 * done) / total) + '%';
+    if (readyEl) readyEl.textContent = `${hhmmss(done)} of ${hhmmss(total)} dubbed`;
+    if (stageEl) stageEl.textContent = s.stage || 'Dubbing';
+
+    if (s.status === 'ready' || s.status === 'failed') {
+      FINISHED = true;
+      clearInterval(liveTimer); liveTimer = null;
+      // Reload into the finished page, keeping the viewer where they were.
+      const at = player.currentTime, playing = !player.paused;
+      RESUME = { id, at, playing };
+      render();
+    }
+  };
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = setInterval(tick, 2000);
+  tick();
+}
+
+let liveTimer = null;
+let RESUME = null;
+let FINISHED = false;
 
 /* -------------------------------------------------------------- router --- */
 async function render() {
   if (poller) { clearInterval(poller); poller = null; }
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  const old = document.getElementById('player');
+  if (old && old.__hls) { try { old.__hls.destroy(); } catch (e) {} }
   const hash = location.hash || '#/';
   const watch = hash.match(/^#\/watch\/([a-z0-9]+)/i);
 

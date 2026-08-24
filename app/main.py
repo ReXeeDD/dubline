@@ -13,7 +13,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, Respons
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
-from . import library, llm, media, pipeline, subtitles, translate, tts, voiceclone
+from . import (hlsout, library, llm, media, pipeline, subtitles, translate, tts,
+               voiceclone)
 from .config import (LIBRARY, ROOT, key_locations, load_settings,
                      save_settings)
 
@@ -146,8 +147,30 @@ def api_status(vid: str):
     v = library.get(vid)
     if not v:
         raise HTTPException(404, "Video not found")
-    return {k: v[k] for k in ("id", "status", "stage", "progress", "error",
-                              "line_count", "duration")}
+    out = {k: v[k] for k in ("id", "status", "stage", "progress", "error",
+                             "line_count", "duration")}
+    out["stream"] = hlsout.status(library.vdir(vid))
+    return out
+
+
+# ------------------------------------------------------------ live stream ---
+# The dub is published as HLS while it is still being made, so a long video can
+# be watched from the start instead of waiting for the whole thing to finish.
+@app.get("/api/videos/{vid}/stream/{path:path}")
+def api_stream(vid: str, path: str, request: Request):
+    root = (library.vdir(vid) / "hls").resolve()
+    target = (root / path).resolve()
+    if not str(target).startswith(str(root)) or not target.is_file():
+        raise HTTPException(404, "Not part of this stream")
+
+    kind = ("application/vnd.apple.mpegurl" if target.suffix == ".m3u8"
+            else "video/mp2t" if target.suffix == ".ts" else "application/json")
+    if target.suffix == ".m3u8":
+        # A growing playlist must never be served from cache, or the player
+        # keeps replaying the version it first saw and never sees new segments.
+        return Response(target.read_bytes(), media_type=kind,
+                        headers={"Cache-Control": "no-store"})
+    return ranged(target, request, kind)
 
 
 @app.delete("/api/videos/{vid}")

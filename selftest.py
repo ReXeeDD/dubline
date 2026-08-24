@@ -6,10 +6,13 @@ timestamps. Needs internet for edge-tts, but no API key.
 """
 from __future__ import annotations
 
+import inspect
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -200,6 +203,116 @@ def _quality_checks() -> None:
           and translate.LANG_NAMES.get("vi") == "Vietnamese")
 
 
+def _stream_checks() -> None:
+    """Section 9: watching a video while it is still being dubbed."""
+    import numpy as np
+
+    from app import hlsout, pipeline, translate, tts
+
+    print("\n9. Live streaming while the dub is still being made")
+
+    # -- windows must tile the whole timeline with no gap and no overlap ----
+    segs = [{"id": i, "start": i * 2.0, "end": i * 2.0 + 1.8,
+             "text": "x", "en": "line"} for i in range(600)]
+    total = 1200.0
+    bounds = pipeline._window_bounds(segs, total)
+    covers = all(bounds[k][2] == bounds[k + 1][2] - (bounds[k + 1][2] - bounds[k][2])
+                 for k in range(len(bounds) - 1))
+    starts_at_zero = bounds[0][0] == 0
+    reaches_end = abs(bounds[-1][2] - total) < 1e-6
+    contiguous = all(bounds[k][1] == bounds[k + 1][0] for k in range(len(bounds) - 1))
+    check("windows cover the whole video", starts_at_zero and reaches_end and covers,
+          f"{len(bounds)} windows, last ends {bounds[-1][2]:.0f}s")
+    check("windows hand over without skipping a line", contiguous)
+    check("the first window is short", bounds[0][2] <= 60,
+          f"first is {bounds[0][2]:.0f}s, last is "
+          f"{bounds[-1][2] - bounds[-2][2]:.0f}s")
+
+    # -- the seam. A window must return exactly its own samples, and a line
+    #    running past the end must survive into the next one rather than being
+    #    cut - a lost sample desyncs everything after it.
+    mixer = tts.StreamMixer(SEGMENTS, DURATION, "en-US-BrianNeural", WORK)
+    mixer.carry = np.ones(int(2.0 * SR), dtype=np.float32) * 0.5   # pretend spill
+    first = mixer.render(0, 0, 5.0)
+    check("a window returns exactly its own length", len(first) == int(5.0 * SR),
+          f"{len(first)} samples for 5.0s at {SR}Hz")
+    check("spill from the previous window is mixed in, not dropped",
+          float(np.max(np.abs(first[:int(2.0 * SR)]))) > 0.4)
+    check("the clock advances by exactly one window", abs(mixer.pos - 5.0) < 1e-9)
+
+    mixer.carry = np.zeros(int(mixer.TAIL_SECONDS * SR), dtype=np.float32)
+    mixer.carry[:int(0.2 * SR)] = 0.3
+    tail = mixer.drain()
+    check("the final drain keeps the audio and not the empty buffer",
+          0 < len(tail) <= int(0.25 * SR),
+          f"{len(tail) / SR:.2f}s kept out of a {mixer.TAIL_SECONDS:.0f}s buffer")
+
+    # -- a daily limit is not something a backoff can wait out ---------------
+    daily = ("Error code: 429 - rate limit reached ... on tokens per day (TPD): "
+             "Limit 200000, Used 199335. Please try again in 24m51.264s.")
+    minute = "Error code: 429 - on tokens per minute (TPM). Please try again in 2.5s."
+    check("a daily limit is told apart from a per-minute one",
+          "per day" in daily.lower() and "per day" not in minute.lower())
+    check("the reset time is read back for the message",
+          translate._reset_hint(daily) == "resets in 24m51.264s")
+
+    # -- both playlists must agree about whether the stream has ended --------
+    src = inspect.getsource(hlsout.LiveStream)
+    check("the picture is published open-ended like the audio",
+          "omit_endlist" in src and '"event"' in src)
+    # append_list makes ffmpeg believe it is resuming, and it then opens the
+    # playlist with EXT-X-DISCONTINUITY, which stops hls.js lining the audio up
+    # against the picture. The flag value is what matters, not the word - it is
+    # named in a comment right above it.
+    flags = [ln for ln in src.splitlines() if "hls_flags" in ln and "#" not in ln]
+    check("the audio playlist does not open with a discontinuity",
+          bool(flags) and all("append_list" not in ln for ln in flags),
+          "; ".join(f.strip() for f in flags))
+
+    # -- streaming must not cost more requests than dubbing in one pass ------
+    # Groq meters requests per day as well as tokens, so a window boundary that
+    # cuts a batch short turns into a whole extra request paying a full system
+    # prompt for a handful of lines. Batches sit on a grid across the whole
+    # transcript for exactly this reason; if that ever regresses, the plans stop
+    # matching and the daily allowance starts running out sooner.
+    lines = [{"id": i + 1, "start": i * 2.0, "end": i * 2.0 + 1.8,
+              "text": f"line {i}", "en": ""} for i in range(437)]
+    duration = lines[-1]["end"]
+
+    def plan(windows):
+        seen, work = [], [dict(s) for s in lines]
+
+        class Fake:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(*, messages, **kw):
+                        ids = [int(m) for m in
+                               re.findall(r"^(\d+)\|", messages[-1]["content"], re.M)]
+                        seen.append(len(ids))
+                        body = "".join(f"{i}|line {i}\n" for i in ids)
+                        return SimpleNamespace(choices=[SimpleNamespace(
+                            message=SimpleNamespace(content=body))], usage=None)
+
+        budgets: dict = {}
+        for lo, hi in windows:
+            translate.translate(Fake(), work, "fake", "vi", clients=[Fake()],
+                                system="SYS", window=(lo, hi), budgets=budgets)
+        return seen, sum(1 for s in work if s["en"])
+
+    total = len(lines)
+    one, done_one = plan([(0, total)])
+    windows = [(lo, hi) for lo, hi, _ in pipeline._window_bounds(lines, duration)]
+    many, done_many = plan(windows)
+    check("streaming costs no extra requests than one pass",
+          len(many) == len(one),
+          f"{len(many)} requests over {len(windows)} windows vs {len(one)} in one pass")
+    check("the batches are the same ones either way", many == one,
+          f"sizes {sorted(set(many))}")
+    check("windowing still translates every line",
+          done_many == done_one == total, f"{done_many}/{total} lines")
+
+
 def main() -> None:
     if WORK.exists():
         shutil.rmtree(WORK, ignore_errors=True)
@@ -336,6 +449,7 @@ def main() -> None:
 
     _resume_checks()
     _quality_checks()
+    _stream_checks()
 
     print("\n" + "=" * 62)
     print("  RESULT:", "ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")

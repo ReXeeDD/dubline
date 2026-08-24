@@ -4,3 +4,4 @@ python-multipart>=0.0.9
 groq>=0.11
 edge-tts>=7.0
 numpy>=1.24
+soundfile>=0.12

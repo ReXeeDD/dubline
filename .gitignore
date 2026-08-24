@@ -1,4 +1,53 @@
-bin/
+# ---------------------------------------------------------------- secrets --
+# The Groq API key is written to data/settings.json and cached a second time in
+# data/cache/credentials.json. All of data/ is ignored below, but both names are
+# listed again here on purpose: a stray copy anywhere else in the tree is still
+# caught, and anyone reaching for `git add -f` has to get past two rules.
+settings.json
+credentials.json
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+
+# ------------------------------------------------------------------- data --
+# Everything the app writes at runtime: the library (whole video files - tens of
+# GB), transcripts, the API key, the sqlite database, model caches, temp files.
+# None of it belongs in the repo, and a fresh clone recreates the folders empty.
 data/
+
+# ffmpeg.exe + ffprobe.exe, ~180 MB. `python setup.py` downloads them on first
+# run, so shipping them would only make the clone slower.
+bin/
+
+# --------------------------------------------------------- voice models ----
+# Trained RVC models are large and are usually somebody's actual voice. They
+# live in data/voices/<id>/, already covered above; these patterns stop one
+# being committed from anywhere else by accident.
+*.pth
+*.index
+*.onnx
+*.ckpt
+*.safetensors
+
+# ----------------------------------------------------------------- python --
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ------------------------------------------------------------------ local --
+.claude/
+.vscode/
+.idea/
+*.log
+
+# ------------------------------------------------------------ os leavings --
+Thumbs.db
+desktop.ini
+.DS_Store

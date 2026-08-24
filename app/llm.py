@@ -132,6 +132,19 @@ def translation_model(cfg: dict) -> str:
     return cfg["llm_model"]
 
 
+def helper_model(cfg: dict) -> str:
+    """A model to run side work on, so the translator keeps its own budget.
+
+    Rate limits are per model, so putting the cast-list request on a helper
+    means the primary model starts translating against a full allowance rather
+    than one it has already spent.
+    """
+    helpers = [m for m in (cfg.get("llm_helpers") or []) if m]
+    if cfg.get("llm_provider") == "local" or not helpers:
+        return translation_model(cfg)
+    return helpers[-1]
+
+
 def list_local_models(base_url: str = DEFAULT_LOCAL_URL, timeout: float = 1.5) -> list[str]:
     """Short timeout on purpose - LM Studio is usually not running, and the
     Settings panel must not stall waiting to find that out."""

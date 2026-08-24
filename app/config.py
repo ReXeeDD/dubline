@@ -57,11 +57,15 @@ DEFAULTS = {
     "llm_provider": "groq",
     "local_base_url": "http://localhost:1234/v1",
     "local_model": "",
-    "source_language": "zh",
-    # "rei" is the locally trained cloned voice in data/voices/rei. Cloned
-    # voices are spoken by their base edge-tts voice first, then re-timbred, so
-    # every timing and prosody setting below still applies.
-    "voice": "rei",
+    # "auto" lets Whisper name the language itself, which is also what tells
+    # the translator which pronoun system it is reading. Set it explicitly
+    # only if detection keeps guessing wrong on quiet or accented audio.
+    "source_language": "auto",
+    # A stock edge-tts voice, so a fresh install dubs with no extra downloads.
+    # Cloned voices installed under data/voices/ appear in the same list and
+    # are spoken by their base edge-tts voice first, then re-timbred, so every
+    # timing and prosody setting below still applies to them too.
+    "voice": "en-US-BrianNeural",
     # Retrieval strength against the training set. Higher locks timbre harder
     # but can smear consonants; 0.5 is the usual balance.
     "clone_index_rate": 0.5,

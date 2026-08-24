@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import shutil
+import threading
 import time
 import traceback
+import wave
 from pathlib import Path
 
+import numpy as np
 from groq import Groq
 
-from . import asr, library, llm, subtitles, translate, tts, voiceclone
-from .media import ASR_EXT, extract_audio, media_info, mux, thumbnail
+from . import asr, hlsout, library, llm, subtitles, translate, tts, voiceclone
+from .media import SR, ASR_EXT, extract_audio, media_info, mux, thumbnail
 
 STATE_FILE = "stage.json"
 
@@ -154,21 +158,18 @@ def process(vid: str, opts: dict) -> None:
         lang = _state(work).get("lang") or opts["source_language"]
         library.update(vid, line_count=len(segments), source_lang=lang)
 
-        # ------------------------------------------------------ translate ---
-        # Lines already carrying an `en` value are left alone by translate(),
-        # so an interrupted run only pays for the ones still missing.
-        progress(f"Translating {len(segments)} lines to English", 45)
-        save = _checkpointer(vid)
+        # --------------------------------------------- translate + speak ---
+        # Both stages run a window at a time and publish as they go, so the
+        # video becomes watchable from the start long before the end of it has
+        # been translated. Lines already carrying an `en` value are skipped, so
+        # an interrupted run only pays for what is still missing.
         clients = llm.make_translation_clients(opts)
-        segments = translate.translate(
-            clients[0], segments,
-            llm.translation_model(opts), lang, progress,
-            models=(opts.get("llm_helpers") or [])
-            if opts.get("llm_provider") != "local" else None,
-            clients=clients, checkpoint=save, cache_dir=work)
-        save(segments, force=True)
+        dub, stats = _stream_dub(vid, src, segments, duration, opts, work,
+                                 folder, progress, lang, clients)
+        library.save_segments(vid, segments)
 
-        _finish(vid, src, segments, duration, opts, work, folder, progress)
+        _finish(vid, src, segments, duration, opts, work, folder, progress,
+                dub=dub, stats=stats)
 
     except Exception as exc:
         library.update(vid, status="failed", error=f"{exc}",
@@ -294,6 +295,176 @@ def remix(vid: str, opts: dict) -> None:
                        stage="Failed: " + str(exc)[:180])
 
 
+def _window_bounds(segments: list[dict], total: float,
+                   first: float = 45.0, cap: float = 300.0) -> list[tuple]:
+    """Split the video into (lo, hi, until) windows to dub one at a time.
+
+    Windows start short and grow. The first one only has to be long enough to
+    give the viewer somewhere to start, and every second spent on it is a second
+    they are still waiting; later windows are long because per-window overhead
+    is paid once each and by then playback is already running ahead of them.
+    """
+    out: list[tuple[int, int, float]] = []
+    t, size, i = 0.0, first, 0
+    while t < total - 1e-3:
+        until = min(total, t + size)
+        j = i
+        while j < len(segments) and segments[j]["start"] < until:
+            j += 1
+        out.append((i, j, until))
+        i, t, size = j, until, min(cap, size * 2)
+    return out
+
+
+def _stream_dub(vid: str, src: Path, segments: list[dict], duration: float,
+                opts: dict, work: Path, folder: Path, progress, lang: str,
+                clients: list) -> tuple[Path, dict]:
+    """Translate, speak and publish the dub window by window, in order.
+
+    Translation runs one window ahead of speech, so the two stages overlap
+    instead of queueing. Everything is fed to a live HLS stream as it is
+    finished, which is what lets the video be watched from the start while the
+    end of it has not been translated yet.
+    """
+    stream = hlsout.LiveStream(folder, src, duration)
+    progress("Preparing the stream", 42)
+    stream.start()          # picture is segmented here - about a second
+
+    # One cast list for the whole video, settled before the first line is
+    # translated. Building it per window would let the same character be
+    # spelled differently in different parts of the same episode.
+    glossary = translate.cast_list(clients[0], segments,
+                                   llm.helper_model(opts), lang, work)
+    system = translate.build_system(lang, glossary)
+
+    bounds = _window_bounds(segments, duration)
+    mixer = tts.StreamMixer(segments, duration, opts["voice"], work,
+                            max_speedup=float(opts.get("max_speedup", 1.7)),
+                            pitch=int(opts.get("pitch", 0)),
+                            speed=int(opts.get("speed", 0)),
+                            volume=int(opts.get("volume", 0)))
+
+    ready: queue.Queue = queue.Queue(maxsize=1)
+    failure: list[BaseException] = []
+
+    def early(stage: str, pct: int) -> None:
+        """Report translation only until there is something to watch.
+
+        Once playback can start, the consumer's "watchable up to" message is
+        the useful one and this would fight it for the same field. Before then
+        this is the only sign of life there is - and a rate-limit backoff can
+        hold the first window for minutes, which without this looks frozen.
+        """
+        if stream.ready_seconds <= 0:
+            progress(stage, min(pct, 44))
+
+    # Shared by every window. These carry what each model's remaining budget
+    # actually is, and that knowledge has to outlive a single window.
+    budgets: dict = {}
+
+    def translate_ahead() -> None:
+        try:
+            for lo, hi, until in bounds:
+                if hi > lo:
+                    translate.translate(
+                        clients[0], segments, llm.translation_model(opts), lang,
+                        early, models=(opts.get("llm_helpers") or [])
+                        if opts.get("llm_provider") != "local" else None,
+                        clients=clients, window=(lo, hi), system=system,
+                        budgets=budgets)
+                ready.put((lo, hi, until))
+        except BaseException as exc:       # hand it to the consumer to raise
+            failure.append(exc)
+        finally:
+            ready.put(None)
+
+    worker = threading.Thread(target=translate_ahead, daemon=True)
+    worker.start()
+
+    wav = _WavAppender(work / "dub.wav")
+    clone = voiceclone.is_clone(opts.get("voice", ""))
+    try:
+        while True:
+            item = ready.get()
+            if item is None:
+                break
+            lo, hi, until = item
+            pcm = mixer.render(lo, hi, until)
+            if clone:
+                pcm = _convert_window(pcm, opts, work, progress)
+            stream.feed(pcm)
+            wav.write(pcm)
+            library.save_segments(vid, segments)
+            done, pct = until, 45 + int(50 * until / max(1.0, duration))
+            progress(f"Watchable up to {_clock(done)} of {_clock(duration)}", pct)
+
+        if failure:
+            raise failure[0]
+
+        tail = mixer.drain()
+        if tail.size:
+            stream.feed(tail)
+            wav.write(tail)
+        stream.finish()
+    except BaseException:
+        stream.abandon()
+        raise
+    finally:
+        wav.close()
+
+    stats = dict(mixer.stats)
+    stats["max_speedup_used"] = round(stats["max_speedup_used"], 2)
+    if clone:
+        stats["voice_clone"] = opts["voice"]
+        stats["soften"] = int(opts.get("soften", 0))
+    return work / "dub.wav", stats
+
+
+def _convert_window(pcm, opts: dict, work: Path, progress):
+    """Re-timbre one window with the cloned voice, keeping its length exact."""
+    from .media import decode_pcm, write_wav
+    raw, out = work / "win_raw.wav", work / "win_clone.wav"
+    write_wav(pcm, raw)
+    try:
+        voiceclone.convert(raw, out, opts["voice"], opts, None)
+        got = decode_pcm(out)
+        # Conversion is length-preserving, but a sample either way here would
+        # shift everything after it, so the window is pinned to its own size.
+        if len(got) < len(pcm):
+            got = np.pad(got, (0, len(pcm) - len(got)))
+        return got[:len(pcm)]
+    except Exception as exc:
+        progress(f"Voice conversion skipped: {exc}", 90)
+        return pcm
+    finally:
+        raw.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+
+
+class _WavAppender:
+    """Writes the dub track out as it is produced, for the downloadable mp4."""
+
+    def __init__(self, path: Path):
+        self.w = wave.open(str(path), "wb")
+        self.w.setnchannels(1)
+        self.w.setsampwidth(2)
+        self.w.setframerate(SR)
+
+    def write(self, pcm) -> None:
+        self.w.writeframes((np.clip(pcm, -1.0, 1.0) * 32767.0).astype("<i2").tobytes())
+
+    def close(self) -> None:
+        try:
+            self.w.close()
+        except Exception:
+            pass
+
+
+def _clock(seconds: float) -> str:
+    m, s = divmod(int(max(0.0, seconds)), 60)
+    return f"{m}:{s:02d}"
+
+
 def _dub_stamp(segments: list[dict], opts: dict) -> str:
     """Everything the finished dub track depends on, in one value."""
     lines = "\x1f".join(f"{s['id']}:{s['start']}:{s.get('en', '')}" for s in segments)
@@ -304,22 +475,35 @@ def _dub_stamp(segments: list[dict], opts: dict) -> str:
 
 
 def _finish(vid: str, src: Path, segments: list[dict], duration: float,
-            opts: dict, work: Path, folder: Path, progress) -> None:
-    """Shared tail of both pipelines: TTS, alignment, subtitles, mux."""
+            opts: dict, work: Path, folder: Path, progress,
+            dub: Path | None = None, stats: dict | None = None) -> None:
+    """Shared tail of both pipelines: TTS, alignment, subtitles, mux.
+
+    `dub` and `stats` are passed in by the streaming pipeline, which has
+    already built the track window by window; without them the track is built
+    here in one pass, which is what re-voicing an existing video does.
+    """
     # ------------------------------------------------------------- speech ---
     # A finished dub track is worth a lot: for a cloned voice it carries the
     # GPU conversion pass, which is the single most expensive step in the whole
     # pipeline. If the last run got that far and nothing it depends on has
     # changed, the encode is the only thing left to redo.
-    dub = work / "dub.wav"
     stamp = _dub_stamp(segments, opts)
-    prev = _state(work).get("dub") or {}
-    reuse = (prev.get("stamp") == stamp and dub.is_file()
-             and prev.get("size") == dub.stat().st_size)
+    if dub is not None:
+        _mark(work, "dub", {"stamp": stamp, "size": dub.stat().st_size,
+                            "stats": stats or {}})
+        stats = dict(stats or {})
+        reuse = True
+    else:
+        dub = work / "dub.wav"
+        prev = _state(work).get("dub") or {}
+        reuse = (prev.get("stamp") == stamp and dub.is_file()
+                 and prev.get("size") == dub.stat().st_size)
+        if reuse:
+            stats = dict(prev.get("stats") or {})
 
     if reuse:
-        progress("Reusing the dub track from the last run", 93)
-        stats = dict(prev.get("stats") or {})
+        progress("Preparing the download", 93)
     else:
         dub, stats = tts.build_dub_track(
             segments, opts["voice"], work, duration,
@@ -375,6 +559,10 @@ def _finish(vid: str, src: Path, segments: list[dict], duration: float,
     # The per-chunk transcripts only exist to survive a failure. The finished
     # transcript is in the library now, so they have nothing left to protect.
     shutil.rmtree(work / "asr_parts", ignore_errors=True)
+    # Same for the stream: it exists so the video can be watched before it is
+    # finished, and dubbed.mp4 now does that job better. Keeping it would cost
+    # roughly another copy of the video per title - about 140 MB an hour.
+    shutil.rmtree(folder / "hls", ignore_errors=True)
     # work/dub.wav is deliberately kept so the audio mix can be changed later
     # without re-synthesising every line
     shutil.rmtree(work / "__pycache__", ignore_errors=True)

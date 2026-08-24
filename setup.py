@@ -86,7 +86,8 @@ def check_python_deps() -> list[str]:
     missing = []
     for mod, pkg in [("fastapi", "fastapi"), ("uvicorn", "uvicorn[standard]"),
                      ("groq", "groq"), ("edge_tts", "edge-tts"),
-                     ("numpy", "numpy"), ("multipart", "python-multipart")]:
+                     ("numpy", "numpy"), ("multipart", "python-multipart"),
+                     ("soundfile", "soundfile")]:
         try:
             __import__(mod)
         except ImportError:
