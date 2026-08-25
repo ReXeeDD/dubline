@@ -941,6 +941,13 @@ async function renderWatch(id) {
             <button data-sub="src">Original subs</button>
             <button data-sub="off">Off</button>
           </div>`}
+          <div class="speed">
+            <label for="speed">Speed</label>
+            <input id="speed" type="range" min="0.25" max="3" step="0.01" value="1"
+                   aria-label="Playback speed">
+            <button class="speed-val" id="speed-val"
+                    title="Click to go back to normal speed">1.00&times;</button>
+          </div>
           <span class="sep"></span>
           ${live ? '' : `<button class="btn ghost" id="btn-revoice">Voice &amp; audio</button>
           <a class="btn ghost" href="/media/${id}/video" download="${esc(v.title)}.mp4">Download</a>
@@ -979,6 +986,37 @@ async function renderWatch(id) {
 
   const player = document.getElementById('player');
   const linesBox = document.getElementById('lines');
+
+  /* Playback speed. A dub is worth slowing down or nudging along by a few
+     percent rather than the player's fixed 0.25 jumps, so this is a continuous
+     control: 0.01 steps, and the arrow keys move it one step at a time once it
+     has focus. The reading doubles as the reset - click it to return to 1x,
+     which is otherwise fiddly to land on by dragging. */
+  const speed = document.getElementById('speed');
+  const speedVal = document.getElementById('speed-val');
+  const setSpeed = (raw, save = true) => {
+    const rate = Math.min(3, Math.max(0.25, Math.round((+raw || 1) * 100) / 100));
+    player.playbackRate = rate;
+    // Keep the voice at its own pitch instead of chipmunking it. Browsers
+    // default to this, but the prefixed forms are cheap insurance.
+    player.preservesPitch = true;
+    player.mozPreservesPitch = player.webkitPreservesPitch = true;
+    speed.value = rate;
+    speedVal.textContent = rate.toFixed(2) + '×';
+    speedVal.classList.toggle('changed', Math.abs(rate - 1) > 0.004);
+    if (save) { try { localStorage.setItem('dubline.speed', rate); } catch (e) { /* private mode */ } }
+  };
+  speed.oninput = () => setSpeed(speed.value);
+  speedVal.onclick = () => setSpeed(1);
+  // Chosen once and kept, the way every other player behaves - and the reading
+  // sits next to the slider so a rate carried over from last time is visible
+  // rather than a mystery.
+  let saved = 1;
+  try { saved = parseFloat(localStorage.getItem('dubline.speed')) || 1; } catch (e) { /* ignore */ }
+  setSpeed(saved, false);
+  // The element re-applies its default rate when a new source is attached, so
+  // reassert after the picture is actually there - live streams attach late.
+  player.addEventListener('loadedmetadata', () => setSpeed(speed.value, false));
 
   if (live) startLive(id, player, v);
 

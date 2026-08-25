@@ -313,6 +313,99 @@ def _stream_checks() -> None:
           done_many == done_one == total, f"{done_many}/{total} lines")
 
 
+def _dub_quality_checks() -> None:
+    """Section 10: two voices never overlap, and the audit only flags real faults."""
+    from app import translate, tts
+
+    print("\n10. Keeping the dub clean")
+
+    # -- a line too long for its slot must not run over the next speaker ------
+    # Back-to-back lines with no silence between them, which is what this
+    # material actually looks like: on real episodes 98% of lines have no gap
+    # after them, so an overrun always lands on top of speech.
+    segs = [{"id": i, "start": i * 3.0, "end": i * 3.0 + 3.0, "en": "a line here"}
+            for i in range(6)]
+    results = {i: {"file": "x", "duration": 7.0, "native_rate": 1.3}
+               for i in range(6)}          # 7s of speech for a 3s slot
+    stats = {"compressed": 0, "max_speedup_used": 1.0, "crowded": 0, "clipped": 0}
+    plan = tts._plan(segs, results, 18.0, 1.7, 0, 6, stats)
+
+    worst = 0.0
+    for seg, r, tempo, limit in plan[:-1]:
+        played = min(r["duration"] / tempo, limit)
+        worst = max(worst, seg["start"] + played - (seg["start"] + 3.0))
+    check("no line is allowed to run into the next one", worst <= 0.0,
+          f"worst finish is {worst:+.3f}s relative to the next line's start")
+    check("the last line may keep its tail", plan[-1][3] == float("inf"))
+    check("a crowded line is compressed past the viewer's cap",
+          stats["crowded"] == 5 and max(t for _, _, t, _ in plan) > 1.55,
+          f"{stats['crowded']} rescued, hardest {max(t for _, _, t, _ in plan):.2f}x")
+    check("an impossible line is cut rather than left overlapping",
+          stats["clipped"] > 0, f"{stats['clipped']} clipped")
+    ceiling = tts.RESCUE_TOTAL_RATE + 1e-6
+    check("the rescue never makes speech unintelligible",
+          all(t * results[s["id"]]["native_rate"] <= ceiling
+              for s, _, t, _ in plan),
+          f"total rate stays at or under {tts.RESCUE_TOTAL_RATE}x")
+
+    # -- both assemblers must make the same decisions ------------------------
+    src = inspect.getsource(tts.build_dub_track)
+    check("the one-pass assembler uses the shared planner", "_plan(" in src,
+          "it used to carry its own copy, which could drift from the streaming one")
+
+    # -- the audit: every one of these is a real line from a finished episode -
+    cast = ("The narrator and main character is Lin. Narration is Lin speaking "
+            'as "I".\n李=Lin (male)')
+    faulty = [
+        ({"id": 1, "start": 0, "end": 6, "text": "x",
+          "en": "Bai Ningbing is proud that his husband can do what others can't."},
+         "a woman called he"),
+        ({"id": 2, "start": 0, "end": 6, "text": "x",
+          "en": "You watch this and smile, saying nothing at all."},
+         "narration slipped into the second person"),
+        ({"id": 3, "start": 0, "end": 6, "text": "x",
+          "en": "At this moment they feel no gratitude, and they've even thought that if"},
+         "the sentence stops mid-thought"),
+        ({"id": 4, "start": 0, "end": 2, "text": "x",
+          "en": "It moved the brides far more than any lavish banquet ever could have, "
+                "a pot of soup and a bowl of rice bringing all three women to tears."},
+         "far too long for a two second slot"),
+    ]
+    for seg, why in faulty:
+        check(f"caught: {why}", bool(translate.audit([seg], cast, "zh")))
+
+    clean = [
+        {"id": 5, "start": 0, "end": 6, "text": "x",
+         "en": "You should eat first, husband."},                  # real dialogue
+        {"id": 6, "start": 0, "end": 6, "text": "x",
+         "en": "She eyed my belongings and smiled."},
+        {"id": 7, "start": 0, "end": 6, "text": "x",
+         "en": "He leered at them. Never, we would rather die."},
+    ]
+    flagged = translate.audit(clean, cast, "zh")
+    check("leaves correct lines alone", not flagged,
+          f"{len(flagged)} false alarms out of {len(clean)}")
+
+    # -- a repair is kept only when it is genuinely better -------------------
+    seg = {"id": 9, "start": 0.0, "end": 6.0, "text": "x",
+           "en": "You stared at the road as a group approached."}
+    worse = {9: "You just stared and"}          # still 2nd person, now truncated
+    better = {9: "I stared at the road as a group approached."}
+
+    for label, reply, expect in (("a worse rewrite is refused", worse, False),
+                                 ("a better rewrite is kept", better, True)):
+        trial = [dict(seg)]
+        real = translate._call
+        translate._call = lambda *a, **k: "\n".join(
+            f"{i}|{v}" for i, v in reply.items())
+        try:
+            out = translate.polish([object()], trial, ["m"], "zh", cast)
+        finally:
+            translate._call = real
+        check(label, (out["fixed"] == 1) is expect,
+              f"kept: {trial[0]['en'][:46]}")
+
+
 def main() -> None:
     if WORK.exists():
         shutil.rmtree(WORK, ignore_errors=True)
@@ -450,6 +543,7 @@ def main() -> None:
     _resume_checks()
     _quality_checks()
     _stream_checks()
+    _dub_quality_checks()
 
     print("\n" + "=" * 62)
     print("  RESULT:", "ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")

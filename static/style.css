@@ -176,6 +176,43 @@ video { width: 100%; display: block; aspect-ratio: 16/9; background: #000; }
 }
 .pill-group button.on { background: var(--text); color: var(--bg); }
 
+/* ------------------------------------------------------- playback speed --- */
+.speed {
+  display: inline-flex; align-items: center; gap: 9px; flex-shrink: 0;
+  background: var(--bg-3); border-radius: 999px; padding: 3px 8px 3px 14px;
+}
+.speed label { font-size: 13px; font-weight: 500; color: var(--text-2); }
+
+/* Wide enough that 0.01 of range is about a pixel of travel, which is the
+   whole point of the control - a short slider would quantise it by hand. */
+.speed input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  flex: 0 0 148px; width: 148px; height: 4px; margin: 0;
+  background: var(--line); border-radius: 999px; outline: none; cursor: pointer;
+}
+.speed input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text); border: none; cursor: pointer;
+}
+.speed input[type="range"]::-moz-range-thumb {
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text); border: none; cursor: pointer;
+}
+.speed input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Doubles as the reset button, so it has to look pressable. Tabular figures
+   stop the row twitching as the number changes under the drag. */
+.speed-val {
+  min-width: 54px; padding: 5px 10px; border-radius: 999px;
+  font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--text-2); background: transparent;
+}
+.speed-val:hover { background: var(--bg-hover); color: var(--text); }
+.speed-val.changed { color: var(--accent-ink); background: var(--accent); }
+
 .statgrid {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr));
   gap: 12px; background: var(--bg-2); border-radius: var(--radius);

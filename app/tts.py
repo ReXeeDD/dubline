@@ -37,6 +37,34 @@ BREATH_RUNON = 0.09      # mid-thought, where a speaker barely lifts
 # speech sounds far less human than a missing pause.
 BREATH_TEMPO_LIMIT = 1.25
 
+# What to do when a line still will not fit even at the speed-up the viewer
+# allowed. Until now the answer was to let it run on top of the next line, and
+# on real material that happened constantly: measured across seven finished
+# videos, 562 lines overlapped the next speaker, the worst by 3.4 seconds. In
+# this genre 98% of lines have no gap after them at all, so an overrun always
+# lands on speech rather than on silence.
+#
+# Two voices at once is worse than fast speech, so a line that is about to
+# collide is compressed past the viewer's cap - but only that line, only by as
+# much as the collision needs, and never past a rate that stops being words.
+RESCUE_TEMPO_CEIL = 1.9    # assembly-time compression allowed to avoid a clash
+RESCUE_TOTAL_RATE = 2.15   # total of voice rate and assembly rate, never passed
+MIN_SEPARATION = 0.04      # silence guaranteed before the next line starts
+
+
+def _fit(clip: np.ndarray, limit: float) -> np.ndarray:
+    """Cut a clip that would still run into the next speaker, and fade it out.
+
+    Only reached when even the rescue tempo was not enough - roughly one line in
+    a thousand. The fade is far longer than the usual butt-joint ramp so the
+    voice sounds like it trails off rather than being sliced mid-word.
+    """
+    # The final line is given an unbounded limit - it has nothing to collide
+    # with, and its tail past the end of the video is worth keeping.
+    if limit <= 0 or limit == float("inf") or len(clip) <= int(limit * SR):
+        return fade(clip)
+    return fade(clip[:int(limit * SR)], ms=55.0)
+
 
 # ------------------------------------------------------------------ voices ---
 _VOICE_CACHE: list[dict] | None = None
@@ -289,38 +317,22 @@ def build_dub_track(segments: list[dict], voice: str, workdir: Path,
     # fit the real gap before the next one. Letting a long line push the next
     # line later instead makes the delay accumulate: over 1500 dense lines that
     # compounds into minutes of desync by the end of the video.
-    plan: list[tuple[dict, dict, float]] = []
-    for i, seg in enumerate(segments):
-        r = results.get(seg["id"])
-        if not r or not r.get("file"):
-            continue
-        nxt = segments[i + 1]["start"] if i + 1 < len(segments) else total_duration
-
-        # Ask for a breath, then check what it costs. If leaving the pause would
-        # push this line past a comfortable speaking rate, take a shorter breath
-        # instead - a rushed line is worse than a short pause.
-        want = breath_after(seg.get("en", "")) if i + 1 < len(segments) else MIN_GAP
-        room = nxt - seg["start"]
-        gap = max(0.30, room - want)
-        if r["duration"] / max(gap, 1e-6) > BREATH_TEMPO_LIMIT:
-            relaxed = max(MIN_GAP, r["duration"] / BREATH_TEMPO_LIMIT)
-            gap = max(0.30, min(room - MIN_GAP, relaxed))
-        tempo = r["duration"] / gap if gap > 0 else 1.0
-        # The Settings slider caps the *total* rate, and part of it was already
-        # spent on the faster speaking rate, so only the remainder is available
-        # here. Beyond that speech stops being intelligible, and those few lines
-        # are allowed to run into the next one rather than being mangled.
-        ceiling = max(1.0, min(HARD_TEMPO_CEIL,
-                               max_speedup / r.get("native_rate", 1.0)))
-        tempo = min(max(1.0, tempo), ceiling)
-        plan.append((seg, r, tempo))
+    #
+    # The decisions themselves live in _plan, which the streaming assembler also
+    # calls. This used to be a second copy of that logic, which meant a line
+    # could be timed one way when a video was dubbed in one pass and another way
+    # when it was streamed - and only one of the copies got fixes.
+    stats = {"lines": 0, "compressed": 0, "drift": 0.0, "failed": 0,
+             "max_speedup_used": 1.0, "overlapped": 0, "crowded": 0, "clipped": 0}
+    plan = _plan(segments, results, total_duration, max_speedup,
+                 0, len(segments), stats)
 
     # Decoding is one ffmpeg launch per line; run them across threads so a long
     # video does not spend minutes waiting on serial subprocess startup.
     clips: dict[int, np.ndarray] = {}
     with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
         futures = {pool.submit(decode_pcm, r["file"], tempo): seg["id"]
-                   for seg, r, tempo in plan}
+                   for seg, r, tempo, _lim in plan}
         for fut in as_completed(futures):
             try:
                 clips[futures[fut]] = fut.result()
@@ -328,17 +340,15 @@ def build_dub_track(segments: list[dict], voice: str, workdir: Path,
                 pass
 
     track = np.zeros(int(round(total_duration * SR)) + SR, dtype=np.float32)
-    stats = {"lines": 0, "compressed": 0, "drift": 0.0, "failed": 0,
-             "max_speedup_used": 1.0, "overlapped": 0}
 
     placed_end = 0.0
-    for seg, r, tempo in plan:
+    for seg, r, tempo, limit in plan:
         clip = clips.get(seg["id"])
         if clip is None:
             stats["failed"] += 1
             continue
 
-        clip = fade(clip)
+        clip = _fit(clip, limit)
         start = seg["start"]              # hard anchor - never shifted
         place(track, clip, start)
 
@@ -349,11 +359,8 @@ def build_dub_track(segments: list[dict], voice: str, workdir: Path,
         seg["dub_speedup"] = round(total_rate, 3)
 
         stats["lines"] += 1
-        if total_rate > 1.03:
-            stats["compressed"] += 1
         if start < placed_end - 0.02:
             stats["overlapped"] += 1
-        stats["max_speedup_used"] = max(stats["max_speedup_used"], total_rate)
         placed_end = start + actual
 
     for seg in segments:
@@ -404,7 +411,8 @@ class StreamMixer:
         self.pos = 0.0                                    # start of next window
         self.carry = np.zeros(0, dtype=np.float32)        # spill from last one
         self.stats = {"lines": 0, "compressed": 0, "drift": 0.0, "failed": 0,
-                      "max_speedup_used": 1.0, "overlapped": 0}
+                      "max_speedup_used": 1.0, "overlapped": 0,
+                      "crowded": 0, "clipped": 0}
 
     def render(self, lo: int, hi: int, until: float, progress=None) -> np.ndarray:
         """Speak segments[lo:hi] and return the audio covering [pos, until)."""
@@ -431,19 +439,19 @@ class StreamMixer:
         if plan:
             with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
                 futures = {pool.submit(decode_pcm, r["file"], tempo): seg["id"]
-                           for seg, r, tempo in plan}
+                           for seg, r, tempo, _lim in plan}
                 for fut in as_completed(futures):
                     try:
                         clips[futures[fut]] = fut.result()
                     except Exception:
                         pass
 
-        for seg, r, tempo in plan:
+        for seg, r, tempo, limit in plan:
             clip = clips.get(seg["id"])
             if clip is None:
                 self.stats["failed"] += 1
                 continue
-            clip = fade(clip)
+            clip = _fit(clip, limit)
             place(buf, clip, seg["start"] - self.pos)     # offset within window
             actual = len(clip) / SR
             seg["dub_start"] = round(seg["start"], 3)
@@ -495,11 +503,27 @@ def _plan(segments: list[dict], results: dict, total_duration: float,
         ceiling = max(1.0, min(HARD_TEMPO_CEIL,
                                max_speedup / r.get("native_rate", 1.0)))
         tempo = min(max(1.0, tempo), ceiling)
+
+        # Fitting the slot is preferred; not talking over the next speaker is
+        # required. The last line has nothing to collide with, so it keeps the
+        # tail that runs past the end of the video.
+        if i + 1 < len(segments):
+            limit = max(0.20, nxt - seg["start"] - MIN_SEPARATION)
+            if r["duration"] / tempo > limit:
+                rescue = min(RESCUE_TEMPO_CEIL,
+                             RESCUE_TOTAL_RATE / r.get("native_rate", 1.0))
+                tempo = min(max(tempo, r["duration"] / limit), max(tempo, rescue))
+                stats["crowded"] += 1
+                if r["duration"] / tempo > limit + 0.01:
+                    stats["clipped"] += 1
+        else:
+            limit = float("inf")
+
         if tempo > 1.01:
             stats["compressed"] += 1
         stats["max_speedup_used"] = max(
             stats["max_speedup_used"], round(tempo * r.get("native_rate", 1.0), 3))
-        plan.append((seg, r, tempo))
+        plan.append((seg, r, tempo, limit))
     return plan
 
 

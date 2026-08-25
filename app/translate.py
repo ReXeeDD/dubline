@@ -271,6 +271,262 @@ _REASONING: dict[str, str] = {}
 REASONING_ALLOWANCE = 2.0    # multiplier on max_tokens when reasoning is forced
 
 
+# --------------------------------------------------------------- auditing ---
+# Faults worth a second request, found by reading the finished English rather
+# than by trusting the model to have followed the brief. Each one was taken from
+# a real dubbed episode:
+#
+#   "he's proud that his husband can do what others can't"   (a wife, called he)
+#   "You watch this and smile, saying..."                    (narration in 2nd person)
+#   "...and they've even thought that if they truly..."      (line stops mid-thought)
+#
+# The rules are deliberately narrow. A false flag costs a re-translation of a
+# line that was already right, and the model usually returns something worse the
+# second time, so precision matters more here than recall.
+
+# Relationships that give away a mismatch on their own, whatever the cast list
+# says: in this material a husband is a man and a wife is a woman.
+_CLASH = re.compile(
+    r"\bhis (?:husband|wives)\b|\bher wife\b|\bshe is his (?:husband)\b",
+    re.I)
+_SHE = re.compile(r"\b(?:she|her|hers|herself)\b", re.I)
+_HE = re.compile(r"\b(?:he|him|his|himself)\b", re.I)
+# A line that opens in the second person is narration that slipped out of "I".
+# Restricted to the opening word: a "you" further in is usually a character
+# genuinely addressing someone, and re-asking those makes the dub worse.
+#
+# Someone really being spoken to is told to do something or asked about
+# themselves - "You should eat first, husband", "You're amazing!", "Do you have
+# a sword?". Narration that has slipped reads as plain report: "You were a
+# modern youth", "Your mother died in childbirth", "You stared at the road".
+# Excluding the modal and the question keeps genuine dialogue out of the net.
+_SECOND_PERSON = re.compile(
+    r"^\s*you(?:r\b|\b(?!\s*(?:'|’)?\s*(?:re|ll|ve|d|should|must|can|"
+    r"could|will|would|may|might|need|want|know|see|have to|had better|"
+    r"do|don't)\b))", re.I)
+# The same slip inside the line rather than at the start of it: "Good." You
+# nodded again and walked to the forge.' A "you" opening a SENTENCE and followed
+# by a narrative past-tense verb is a report of what the narrator did, not words
+# said to anybody. Measured over five finished episodes this matches 104 lines,
+# of which roughly six in seven are genuine slips; the rest are a character
+# saying something like "You saved me last time", so the repair brief is told
+# in as many words to leave real dialogue alone.
+_SECOND_PERSON_MID = re.compile(
+    r"(?:^|(?<=[.!?])\s+)You\s+(?:\w+ed|were|had|went|took|felt|saw|knew|"
+    r"got|made|came|gave|found|thought|stood|sat|ran|held|began|kept|"
+    r"seemed|watched|walked|turned|grabbed|stared)")
+# Quoted speech, so it can be taken out of the line before looking for a POV
+# slip. Lines routinely carry both - 'Good." You nodded again and walked to the
+# forge.' - and skipping any line with a quote in it hid every one of those,
+# while testing the whole line would flag the dialogue for being in the second
+# person, which is exactly where it belongs.
+_QUOTED = re.compile(r'["“”‘’][^"“”]*'
+                     r'["“”]')
+_UNFINISHED = re.compile(
+    r"(?:\.\.\.|…)\s*$|\b(?:and|but|so|then|the|an?|to|of|with|that|because|"
+    r"as|for|if|when|while|is|was|were)\s*[.,]?\s*$", re.I)
+_SOURCE_SCRIPT = re.compile(r"[぀-ヿ一-鿿가-힯]")
+_OVER_BUDGET = 1.55      # times max_chars before a line is worth shortening
+
+
+def _cast_genders(glossary: str) -> dict[str, str]:
+    """English name -> 'f'/'m', read back out of the cast list."""
+    out: dict[str, str] = {}
+    for entry in re.split(r",\s*|\n", glossary):
+        m = re.match(r"\s*[^=]+=(.+?)\s*\((female|male)\)\s*$", entry)
+        if m and len(m.group(1)) > 2:
+            out[m.group(1)] = m.group(2)[0]
+    return out
+
+
+def audit(segments: list[dict], glossary: str = "", src: str = "",
+          window: tuple[int, int] | None = None) -> dict[int, list[str]]:
+    """Which finished lines look wrong, and why. No API calls."""
+    narrated = "narrator and main character" in glossary
+    lo, hi = window if window else (0, len(segments))
+    faults: dict[int, list[str]] = {}
+
+    for seg in segments[lo:hi]:
+        en = (seg.get("en") or "").strip()
+        if not en:
+            continue
+        bad: list[str] = []
+
+        if _CLASH.search(en):
+            bad.append("a man is called she, or a woman he - check who is "
+                       "speaking and who is being spoken about")
+        # A question is someone talking to someone, never narration. The two
+        # rules are scoped differently on purpose: opening in the second person
+        # only means anything on a line that is not dialogue at all, while a
+        # narrative past-tense verb is evidence in its own right and can be
+        # trusted in the narration left over once the quotes are removed.
+        narration = _QUOTED.sub(" ", en)
+        slipped = (_SECOND_PERSON_MID.search(narration)
+                   or ('"' not in en and '“' not in en
+                       and _SECOND_PERSON.search(en)))
+        if narrated and slipped and not en.rstrip().endswith("?"):
+            bad.append("narration must be first person - this is the main "
+                       "character talking about himself, so 'I', not 'you'. "
+                       "But if this line is really one character SPEAKING to "
+                       "another, 'you' is correct: leave it exactly as it is")
+        if _UNFINISHED.search(en):
+            bad.append("the sentence stops in the middle - finish it")
+        if _SOURCE_SCRIPT.search(en):
+            bad.append("untranslated source text is left in the line")
+        limit = _budget_chars(seg)
+        if len(en) > limit * _OVER_BUDGET:
+            bad.append(f"far too long to speak in the time - {len(en)} "
+                       f"characters where {limit} fit, say it shorter")
+
+        if bad:
+            faults[seg["id"]] = bad
+    return faults
+
+
+POLISH_BATCH = 20        # flagged lines per repair request
+
+POLISH_SYSTEM = """You are correcting single lines of an English dubbing script.
+Another translator produced them from {src_name} and each line below has a
+specific fault.
+
+INPUT: one line per faulty subtitle, formatted  id|max_chars|fault|source|current
+OUTPUT: one line per id, formatted  id|corrected English
+
+Rules:
+1. Return EVERY id you are given, exactly once, in the same order. Output only
+   the id and the corrected line - never repeat max_chars, the fault or the
+   source text back.
+2. Fix the stated fault. Keep everything else about the line - its meaning, its
+   tone, and the names it uses.
+3. The result must be a complete, grammatical English sentence that a voice
+   actor can read aloud in one breath. Never return a fragment, and never end
+   mid-thought or with an ellipsis standing in for words you left out.
+4. It is spoken over the original actor, so it must fit max_chars characters.
+   Say less rather than saying it badly: cut detail the picture already shows,
+   choose shorter words, and drop what the previous line already established.
+5. If you genuinely cannot improve the line, return it unchanged.
+6. Output NOTHING but the id|line rows."""
+
+
+def _parse_repair(content: str) -> dict[int, str]:
+    """Read the repaired lines, whatever shape the model sent them back in.
+
+    Asked for `id|line`, a model given `id|max_chars|fault|source|line` quite
+    often echoes the whole row instead - and then the plain parser keeps the
+    max_chars field as the translation, so a repair pass silently rewrites every
+    line into the word "105". The corrected text is last either way, so that is
+    what gets taken.
+    """
+    out: dict[int, str] = {}
+    for line in _strip_think(content).splitlines():
+        m = re.match(r"^\s*[-*• ]*(\d{1,7})\s*\|(.*)$", line)
+        if not m:
+            continue
+        text = m.group(2).split("|")[-1].strip().strip('"')
+        if text:
+            out[int(m.group(1))] = text
+    return out
+
+
+def _polish_payload(segments: list[dict], faults: dict[int, list[str]],
+                    ids: list[int]) -> str:
+    by_id = {s["id"]: s for s in segments}
+    rows = []
+    for i in ids:
+        s = by_id[i]
+        why = "; ".join(faults[i])
+        rows.append(f"{i}|{_budget_chars(s)}|{why}|{s.get('text', '')}|{s['en']}")
+    return "\n".join(rows)
+
+
+def polish(clients: list, segments: list[dict], models: list[str], src: str,
+           glossary: str = "", progress=None, budgets: dict | None = None,
+           window: tuple[int, int] | None = None) -> dict:
+    """Re-ask for the lines that came back faulty, and keep only real gains.
+
+    Translation happens 30 lines at a time with no sight of the finished script,
+    so a fault the brief warned about still slips through: the narration drops
+    into "you", a wife is called "he", a sentence stops halfway, a line lands at
+    twice the length that can be spoken in its slot. Measured over seven
+    finished episodes, 3% of Vietnamese lines and up to a third of the Chinese
+    ones carried at least one of those.
+
+    A replacement is accepted only when the audit likes it better than what was
+    there. That matters: a model asked to repair a line it cannot improve will
+    happily return something shorter and worse, and this stage must never make a
+    good line bad.
+    """
+    faults = audit(segments, glossary, src, window)
+    if not faults:
+        return {"checked": 0, "fixed": 0}
+
+    ids = sorted(faults)
+    groups = [ids[i:i + POLISH_BATCH] for i in range(0, len(ids), POLISH_BATCH)]
+    by_id = {s["id"]: s for s in segments}
+    system = POLISH_SYSTEM.format(
+        src_name=LANG_NAMES.get(src, "the source language"))
+    if glossary:
+        system += ("\n\nCAST LIST. These spellings and genders are settled - "
+                   "use them:\n" + glossary)
+
+    pool_models = [m for m in models if m]
+    pairs = [(ci, m) for ci in range(len(clients)) for m in pool_models] or [(0, pool_models[0])]
+    if budgets is None:
+        budgets = {}
+    for ci, m in pairs:
+        budgets.setdefault((ci, m), TokenBudget())
+
+    done = {"n": 0}
+    lock = threading.Lock()
+
+    def run(job):
+        gi, group = job
+        ci, model = pairs[gi % len(pairs)]
+        payload = _polish_payload(segments, faults, group)
+        limit = int(min(2600, max(400, sum(_budget_chars(by_id[i]) for i in group)
+                                  / 3.2 + 6 * len(group) + 80) * 2.0))
+        # A refused request here used to return quietly, so a rate limit at the
+        # wrong moment meant the whole repair pass did nothing and said so only
+        # by reporting zero fixes. Retry the way a translation batch does.
+        reply: dict[int, str] = {}
+        for attempt in range(3):
+            try:
+                reply = _parse_repair(_call(clients[ci], model, system, payload,
+                                            limit, budgets[(ci, model)]))
+                break
+            except Exhausted:
+                return
+            except Exception:
+                if attempt == 2:
+                    return
+                time.sleep(2.0 * (attempt + 1))
+        with lock:
+            for i, new in reply.items():
+                seg = by_id.get(i)
+                new = (new or "").strip()
+                if seg is None or not new or new == seg.get("en"):
+                    continue
+                # Accept only a strict improvement, judged the same way the
+                # line was flagged in the first place.
+                before = len(faults.get(i, []))
+                trial = dict(seg, en=new)
+                after = len(audit([trial], glossary, src).get(i, []))
+                if after < before:
+                    seg["en"] = new
+                    done["n"] += 1
+            if progress:
+                progress(f"Polishing {min(len(ids), (gi + 1) * POLISH_BATCH)}"
+                         f" of {len(ids)} lines", 70)
+
+    jobs = list(enumerate(groups))
+    if len(jobs) == 1:
+        run(jobs[0])
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(pairs) * 2, 6)) as ex:
+            list(ex.map(run, jobs))
+    return {"checked": len(ids), "fixed": done["n"]}
+
+
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
@@ -457,25 +713,28 @@ def _run_batch(client, model: str, system: str, segments: list[dict],
     return result
 
 
-def _sample(segments: list[dict], budget: int = 2400) -> str:
+def _sample(segments: list[dict], budget: int = 3200, lines: int = 110) -> str:
     """Text spread across the whole transcript, not just the opening.
 
     Characters who matter often do not appear until well in, and their gender
     is usually established once, in one line, somewhere in the middle.
+
+    Stopping once a character budget had been spent meant the sample only ever
+    covered the FRONT of a video. Measured on a real 617-line episode: it ran
+    out at line 450, and two of the three wives are introduced after that - so
+    they never reached the cast list, and the dub called both of them "he" for
+    the rest of the hour. Every sampled line is trimmed to a share of the budget
+    instead, so the spread always reaches the last line.
     """
-    if not segments:
+    text = [s.get("text", "").strip() for s in segments]
+    text = [t for t in text if t]
+    if not text:
         return ""
-    step = max(1, len(segments) // 60)
-    picked, total = [], 0
-    for seg in segments[::step]:
-        t = seg.get("text", "").strip()
-        if not t:
-            continue
-        picked.append(t)
-        total += len(t)
-        if total >= budget:
-            break
-    return "\n".join(picked)
+    step = max(1, len(text) / min(lines, len(text)))
+    picked = [text[min(len(text) - 1, int(i * step))]
+              for i in range(min(lines, len(text)))]
+    per = max(24, budget // len(picked))
+    return "\n".join(t[:per] for t in picked)
 
 
 def build_glossary(client, segments: list[dict], model: str, src: str) -> str:

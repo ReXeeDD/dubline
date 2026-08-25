@@ -246,6 +246,14 @@ def retranslate(vid: str, opts: dict) -> None:
             models=(opts.get("llm_helpers") or [])
             if opts.get("llm_provider") != "local" else None,
             clients=clients, checkpoint=save, cache_dir=work)
+        lang = _state(work).get("lang") or opts["source_language"]
+        helpers = (opts.get("llm_helpers") or []) \
+            if opts.get("llm_provider") != "local" else []
+        translate.polish(clients, segments,
+                         [llm.translation_model(opts)] + helpers, lang,
+                         translate.cast_list(clients[0], segments,
+                                             llm.helper_model(opts), lang, work),
+                         progress)
         save(segments, force=True)
 
         duration = media_info(src)["duration"]
@@ -366,12 +374,20 @@ def _stream_dub(vid: str, src: Path, segments: list[dict], duration: float,
         try:
             for lo, hi, until in bounds:
                 if hi > lo:
+                    helpers = (opts.get("llm_helpers") or []) \
+                        if opts.get("llm_provider") != "local" else []
                     translate.translate(
                         clients[0], segments, llm.translation_model(opts), lang,
-                        early, models=(opts.get("llm_helpers") or [])
-                        if opts.get("llm_provider") != "local" else None,
+                        early, models=helpers or None,
                         clients=clients, window=(lo, hi), system=system,
                         budgets=budgets)
+                    # Read back what came out and re-ask for the lines that are
+                    # plainly wrong, while this window is still ahead of the
+                    # speech stage and nothing has been spoken yet.
+                    translate.polish(
+                        clients, segments,
+                        [llm.translation_model(opts)] + helpers, lang,
+                        glossary, early, budgets=budgets, window=(lo, hi))
                 ready.put((lo, hi, until))
         except BaseException as exc:       # hand it to the consumer to raise
             failure.append(exc)
