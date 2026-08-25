@@ -1283,11 +1283,30 @@ async function pollProgress() {
     }
     const bar = el.querySelector('.bar > i');
     const stage = el.querySelector('.stage');
+    const meta = el.querySelector('.card-meta');
+    const live = el.querySelector('.live-row');
     if (bar) {
       bar.style.width = (s.progress || 0) + '%';
       el.querySelector('.bar').classList.toggle('indeterminate', !s.progress);
     }
     if (stage) stage.innerHTML = esc(s.stage || '') + (s.progress ? ` &middot; ${s.progress}%` : '');
+    if (meta) meta.innerHTML = esc(s.stage || 'Waiting');
+    // The Watch button appears partway through the run, so it has to be drawn
+    // here and not only by a full render - a card painted before the first
+    // window was published would otherwise never grow one, and the video would
+    // sit there saying how much of it is watchable with no way to watch it.
+    // Rewritten only when it actually changes: replacing the anchor on every
+    // poll would swallow a click that landed between ticks. The comparison is
+    // against the last markup we wrote rather than against innerHTML, which
+    // reads back normalised - `&middot;` returns as the character itself, so
+    // comparing the two never matches and the anchor is replaced every tick.
+    if (live) {
+      const want = liveButton(s);
+      if (live.dataset.live !== want) {
+        live.dataset.live = want;
+        live.innerHTML = want;
+      }
+    }
     el.dataset.status = s.status;
   }));
 

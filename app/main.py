@@ -41,12 +41,35 @@ def _startup() -> None:
 
 
 # ------------------------------------------------------------------- pages ---
+NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+class FreshStatic(StaticFiles):
+    """Static assets the browser must revalidate before reusing.
+
+    StaticFiles sends no Cache-Control at all, which leaves the browser free to
+    apply heuristic freshness and keep serving app.js from its own disk without
+    ever asking whether it changed. After the app is updated that shows up as
+    the new server quietly running the old JavaScript - the page looks right,
+    nothing errors, and a feature added in the meantime simply never appears.
+
+    `no-cache` does not stop the browser caching; it only requires the ETag to
+    be checked first, so the usual reply is still an empty 304.
+    """
+
+    def file_response(self, *args, **kwargs) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    return HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"))
+    return HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"),
+                        headers=NO_CACHE)
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+app.mount("/static", FreshStatic(directory=str(STATIC)), name="static")
 
 
 # -------------------------------------------------------------- ranged file ---
@@ -475,4 +498,5 @@ def api_health():
 def _404(request: Request, exc):
     if request.url.path.startswith(("/api", "/media")):
         return JSONResponse({"detail": "Not found"}, status_code=404)
-    return HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"))
+    return HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"),
+                        headers=NO_CACHE)
