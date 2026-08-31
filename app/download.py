@@ -60,14 +60,55 @@ def available() -> bool:
         return False
 
 
-def _run(args: list[str], timeout: int = 180) -> str:
-    out = subprocess.run([ytdlp(), *args], capture_output=True, timeout=timeout,
-                         **_NOWIN)
+# Browsers yt-dlp can read a cookie store from. Offered in Settings rather than
+# guessed at, because the one to use is whichever is signed in AND closed.
+BROWSERS = ["chrome", "brave", "edge", "firefox", "opera", "vivaldi", "safari",
+            "chromium", "whale"]
+
+
+def _cookie_args(cfg: dict | None = None) -> list[str]:
+    """--cookies-from-browser, when Settings names one."""
+    if cfg is None:
+        from .config import load_settings
+        cfg = load_settings()
+    browser = (cfg.get("ytdlp_browser") or "").strip().lower()
+    return ["--cookies-from-browser", browser] if browser in BROWSERS else []
+
+
+# YouTube's bot wall, and the two ways it fails. The first is the wall itself;
+# the second is what happens when a browser was named but is currently running,
+# because its cookie database is locked while it is open.
+_BOT_WALL = re.compile(r"confirm you.{0,3}re not a bot|sign in to confirm", re.I)
+_LOCKED = re.compile(r"could not copy|cookie database|could not find .* cookies",
+                     re.I)
+
+
+def _explain(detail: str, cfg: dict | None = None) -> str:
+    """Turn yt-dlp's message into one that says what to do about it."""
+    if _LOCKED.search(detail):
+        return (detail + "  -  that browser is open, and its cookies cannot be "
+                "read while it is running. Close it, or pick a different "
+                "browser under Settings > Downloads.")
+    if _BOT_WALL.search(detail):
+        if _cookie_args(cfg):
+            return (detail + "  -  the cookies were read but YouTube still "
+                    "refused. Sign in to YouTube in that browser, or choose "
+                    "another one under Settings > Downloads.")
+        return ("YouTube is asking this download to prove it is not a bot. "
+                "Open Settings > Downloads and pick a browser you are signed "
+                "in to YouTube with - it must be closed at the time, because "
+                "its cookies cannot be read while it is running.")
+    return detail
+
+
+def _run(args: list[str], timeout: int = 180, cfg: dict | None = None) -> str:
+    out = subprocess.run([ytdlp(), *_cookie_args(cfg), *args],
+                         capture_output=True, timeout=timeout, **_NOWIN)
     if out.returncode != 0:
         msg = out.stderr.decode("utf-8", "ignore").strip().splitlines()
         detail = next((m for m in reversed(msg) if m.strip()), "")
         detail = re.sub(r"^ERROR:\s*", "", detail)
-        raise RuntimeError(detail[:300] or "yt-dlp failed")
+        raise RuntimeError(_explain(detail, cfg)[:400] or "yt-dlp failed")
     return out.stdout.decode("utf-8", "ignore")
 
 
@@ -160,6 +201,7 @@ def fetch(url: str, fmt: str, dst_dir: Path, progress=None) -> Path:
         old.unlink(missing_ok=True)
 
     args = [
+        *_cookie_args(),
         "-f", fmt, "--no-playlist", "--no-warnings", "--newline",
         "--no-part", "--retries", "10", "--fragment-retries", "10",
         "--merge-output-format", "mp4/mkv",
@@ -188,7 +230,8 @@ def fetch(url: str, fmt: str, dst_dir: Path, progress=None) -> Path:
             progress("Joining picture and sound", 98)
     proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(re.sub(r"^ERROR:\s*", "", last)[:300] or "download failed")
+        raise RuntimeError(
+            _explain(re.sub(r"^ERROR:\s*", "", last))[:400] or "download failed")
 
     got = sorted(dst_dir.glob("source.*"), key=lambda p: p.stat().st_size)
     if not got:

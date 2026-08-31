@@ -364,6 +364,69 @@ def _quality_checks() -> None:
           "save_segments" in after,
           "the streaming path only saves at a window boundary")
 
+    # Who is who. Spoken Mandarin makes he, she and it one sound, so the
+    # transcript's pronouns are a coin toss and the chart is the only thing
+    # that can overrule them. Measured on a finished episode before this: a
+    # male character called "she" in 25 lines and "he" in 19, two women called
+    # "he" in 30 and 18 lines, the lead split across three spellings, and the
+    # narrator named as a character who was not the lead.
+    check("a relation word settles the gender, whatever was claimed",
+          translate._settle_gender("m", "his mother", ["江母"]) == "f"
+          and translate._settle_gender("f", "his father", ["江父"]) == "m"
+          and translate._settle_gender("f", "his elder brother", ["江河"]) == "m")
+    # The relation is written relative to the LEAD - "his stepsister" - so the
+    # pronoun in it describes the lead, not the character being classified.
+    check("the relation's own 'his' is not read as the character's gender",
+          translate._settle_gender("m", "his sister", ["x"]) == "f",
+          "including pronouns made every relation read as male")
+    # Chinese given names carry gender in the characters themselves.
+    check("a distinctly female name outranks a wrong guess",
+          translate._settle_gender("m", "his classmate", ["苏婉柔"]) == "f",
+          "the model answered male for a character called 婉柔")
+    check("a name with no signal leaves the stated gender alone",
+          translate._settle_gender("m", "his friend", ["宋景年"]) == "m"
+          and translate._settle_gender("", "a reporter", ["记者"]) == "")
+
+    chart = translate._format_cast(
+        {"names": ["江晨", "江城", "小陈"], "en": "Jiang Chen", "sex": "m",
+         "relation": "the narrator, a student"},
+        [{"names": ["顾清涵"], "en": "Gu Qinghan", "sex": "f",
+          "relation": "his stepsister"},
+         {"names": ["宋景年", "宋锦年"], "en": "Song Jingnian", "sex": "m",
+          "relation": "his best friend"}],
+        [], "zh")
+    check("every spelling of the lead is carried on one row",
+          "江晨, 江城, 小陈" in chart,
+          "three spellings used to become three separate characters")
+    check("the lead is anchored to the first person",
+          "THE MAIN CHARACTER is Jiang Chen" in chart
+          and '"I", "me", "my"' in chart)
+    check("each other character carries a gender and a relation",
+          "Gu Qinghan (female - she/her) - his stepsister" in chart
+          and "宋景年, 宋锦年 = Song Jingnian" in chart)
+    check("the chart still reads as narrated for the point-of-view rules",
+          translate._is_narrated([], chart, "zh"),
+          "the audit's first-person check keys off this")
+
+    # The chart is one cheap call that everything downstream leans on, so it
+    # must not come back empty just because one model is out for the day.
+    tried: list[str] = []
+
+    def only_second_works(client, segments, model, src):
+        tried.append(model)
+        return "" if model == "dead" else "THE MAIN CHARACTER is X - a hero."
+
+    real_bg = translate.build_glossary
+    translate.build_glossary = only_second_works
+    try:
+        got = translate.cast_list(None, [], "dead", "zh", None,
+                                  fallbacks=("alive",))
+    finally:
+        translate.build_glossary = real_bg
+    check("an exhausted model does not cost the video its cast list",
+          bool(got) and tried == ["dead", "alive"],
+          f"tried {tried}")
+
     # What the voice is handed is not what the viewer reads. An English voice
     # has no rule for a Vietnamese tone mark or a non-breaking hyphen, and it
     # reads a leading ellipsis as a long pause at the moment it should be
@@ -810,6 +873,35 @@ def _download_checks() -> None:
     check("the row is created in the state the caller asked for",
           library.create.__doc__ and "may be overridden" in library.create.__doc__,
           "create() used to force every new row to 'queued'")
+
+    # YouTube now answers many unauthenticated requests with "sign in to
+    # confirm you're not a bot", and no yt-dlp version gets past that alone -
+    # the copy here is already the current release. Borrowing the cookies of a
+    # browser that is signed in is yt-dlp's own answer, and it is the
+    # difference between 0 usable formats and 47 on a blocked link.
+    check("no cookie argument unless a browser is chosen",
+          download._cookie_args({"ytdlp_browser": ""}) == []
+          and download._cookie_args({}) == [])
+    check("a chosen browser reaches yt-dlp",
+          download._cookie_args({"ytdlp_browser": "brave"})
+          == ["--cookies-from-browser", "brave"])
+    check("an unknown browser name is ignored rather than passed on",
+          download._cookie_args({"ytdlp_browser": "netscape"}) == [],
+          "yt-dlp would refuse the whole command")
+    check("downloading uses the cookies too, not just probing",
+          "_cookie_args()" in inspect.getsource(download.fetch),
+          "the quality list would work and the download would then fail")
+
+    # The raw message tells the user to edit a command line they never see.
+    bot = "Sign in to confirm you're not a bot. Use --cookies-from-browser"
+    check("the bot wall is explained in terms of the app",
+          "Settings" in download._explain(bot, {"ytdlp_browser": ""}))
+    check("a locked cookie store says which way out",
+          "Close it" in download._explain(
+              "Could not copy Chrome cookie database", {"ytdlp_browser": "chrome"}),
+          "the database cannot be read while that browser runs")
+    check("an ordinary error is passed through untouched",
+          download._explain("Video unavailable", {}) == "Video unavailable")
 
 
 def main() -> None:

@@ -490,7 +490,9 @@ def _is_narrated(segments: list[dict], glossary: str, src: str = "") -> bool:
     writes the hero's own life at him in the second person, line after line,
     and no third-person story does that.
     """
-    if "narrator and main character" in glossary:
+    # Either wording of the anchor built by _format_cast.
+    if ("narrator and main character" in glossary
+            or "THE MAIN CHARACTER is" in glossary):
         return True
     marker = _SECOND_PERSON_SRC.get(src)
     if not marker:
@@ -1033,6 +1035,123 @@ def _is_generic(source: str, english: str) -> bool:
             or bool(_SOURCE_SCRIPT.search(english)))
 
 
+# A relationship word states a gender outright, and it is far more reliable
+# than either the model's guess or the transcript's pronouns - spoken Mandarin
+# makes he, she and it the same sound, so Whisper picks a character at random
+# and the dub inherits the coin toss. Measured on one finished episode, a male
+# character was called "she" in 25 lines and "he" in 19; two women were called
+# "he" in 30 and 18 lines. Where the relation names a role, it decides.
+_FEMALE_WORDS = (
+    "wife", "wives", "mother", "mom", "mum", "daughter", "sister", "aunt",
+    "grandmother", "granddaughter", "niece", "madam", "lady", "girl", "queen",
+    "empress", "princess", "saintess", "priestess", "widow", "bride",
+    "girlfriend", "fiancee", "fiancée", "concubine", "maid", "actress",
+    "stepsister", "stepmother", "mistress", "nun",
+)
+_MALE_WORDS = (
+    "husband", "father", "dad", "son", "brother", "uncle", "grandfather",
+    "grandson", "nephew", "sir", "lord", "boy", "king", "emperor", "prince",
+    "monk", "groom", "boyfriend", "fiance", "fiancé", "master", "man",
+    "stepbrother", "stepfather", "gentleman",
+)
+
+
+# Chinese given names carry gender in the characters themselves, and far more
+# strongly than the surrounding pronouns do. Most of the female set is built on
+# the woman radical or on the classic "graceful/gentle" vocabulary; the male set
+# on strength, height and rank. Kept to characters that are overwhelmingly one
+# or the other in a given name - the merely common ones (清, 明, 华, 欣) are
+# left out on purpose, because a wrong confident answer here is worse than none.
+#
+# This is what settles the case the relation cannot: the model returned
+# "苏婉柔 ... male" while calling her a love interest, and 婉柔 - "gentle and
+# soft" - is not a name a man in this genre is given.
+_NAME_F = set("婉柔娟婷芳丽娜雅秀淑静洁玲燕莉妍姗媛琳蕾萍慧敏兰梅菊凤妃姬嫣娥娇妤婕瑶珊薇茜蓉颖怡妮娅莹璐岚彤霞黛娴")
+_NAME_M = set("强伟军刚勇峰磊涛龙虎昊杰豪雄栋铭钢钧霆霸擎骁锋岳猛冲彪坤")
+
+
+def _gender_from_name(names: list[str]) -> str:
+    """'f'/'m'/'' from the characters of a Chinese given name.
+
+    Surnames are left in: they are drawn from a small fixed set that shares
+    almost nothing with either group above, so scanning the whole name costs
+    nothing and saves having to know where the surname ends.
+    """
+    joined = "".join(names)
+    f = sum(1 for c in joined if c in _NAME_F)
+    m = sum(1 for c in joined if c in _NAME_M)
+    if f > m:
+        return "f"
+    if m > f:
+        return "m"
+    return ""
+
+
+def _settle_gender(stated: str, relation: str, names: list[str] | None = None) -> str:
+    """'f' or 'm' or '' - the relation outranks the model's own answer.
+
+    The model is asked for a gender and usually gets it right, but when it does
+    not, the relation it wrote in the next field almost always gives it away:
+    nothing called "his stepsister" is male. Checking the relation costs a
+    string search and catches exactly the case the pronouns cannot.
+    """
+    said = (stated or "").strip()[:1].lower()
+    said = said if said in ("f", "m") else ""
+    words = re.findall(r"[a-z]+", (relation or "").lower())
+    female = any(w in _FEMALE_WORDS for w in words)
+    male = any(w in _MALE_WORDS for w in words)
+    if female and not male:
+        return "f"
+    if male and not female:
+        return "m"
+    # No role word to go on. The name itself is the next best witness, and a
+    # better one than the model's bare guess: it answered "male" for a
+    # character called 婉柔.
+    from_name = _gender_from_name(names or [])
+    return from_name or said
+
+
+def _format_cast(mc: dict | None, npcs: list[dict], segments: list[dict],
+                 src: str) -> str:
+    """The character chart, as the translator is given it.
+
+    Written as a table rather than a comma-separated list because it carries
+    four things per character now - every spelling the recogniser produced, the
+    one English name, the gender and who they are - and the spellings are the
+    half that stops one person walking through the dub under three names.
+    """
+    lines: list[str] = []
+    if mc:
+        alias = ", ".join(mc["names"])
+        him = {"f": "she/her", "m": "he/him"}.get(mc["sex"], "he/him")
+        lines.append(
+            f"THE MAIN CHARACTER is {mc['en']} - written in the source as "
+            f"{alias}. {mc['relation'] or 'the narrator'}. "
+            f"The narration is {mc['en']} telling their own story, so every "
+            f"narration line is \"I\", \"me\", \"my\" - never their name and "
+            f"never \"you\". Inside somebody else's speech they are \"you\"; "
+            f"spoken about by others they are {him}.")
+    elif _is_narrated(segments, "", src):
+        lines.append(
+            "The narration is the MAIN CHARACTER telling his own story. He is "
+            "never named in it - the source writes his life at him in the "
+            "second person, and every one of those lines is him speaking as "
+            "\"I\". This is the narrator and main character of the whole "
+            "video, and no other character narrates.")
+    if npcs:
+        lines.append(
+            "\nEVERYONE ELSE. Use the English name exactly as written here for "
+            "every spelling on its row, and the gender here for every pronoun "
+            "about them - it outranks the he/she in the transcript, which is a "
+            "recogniser guess:")
+        for n in npcs[:30]:
+            g = {"f": "female - she/her", "m": "male - he/him"}.get(n["sex"], "?")
+            alias = ", ".join(n["names"])
+            rel = f" - {n['relation']}" if n["relation"] else ""
+            lines.append(f"  {alias} = {n['en']} ({g}){rel}")
+    return "\n".join(lines)
+
+
 def build_glossary(client, segments: list[dict], model: str, src: str) -> str:
     """Agree names AND genders before translating.
 
@@ -1050,16 +1169,37 @@ def build_glossary(client, segments: list[dict], model: str, src: str) -> str:
     lang = LANG_NAMES.get(src, "the source language")
     system = (
         f"You are preparing a cast list from {lang} subtitles for a dubbing team.\n"
-        "FIRST LINE - the narrator. Video like this is usually narrated by its "
-        "main character in the first person, mixed with ordinary third-person "
-        "scene description. Decide whether ANY of the narration uses a "
-        "first-person pronoun for a character who is part of the story, and if "
-        "so which character that is. Output  NARRATOR|name  as the very first "
-        "line, or NARRATOR|- only if the narration is entirely third person.\n"
-        "Then list the recurring people and places that HAVE A NAME. A cast "
-        "list is a list of names, and every entry on it is handed to the "
-        "translator as the fixed spelling for that character.\n"
-        "Do NOT list, however often they occur:\n"
+        "\nOne line per character, in this format:\n"
+        "  ROLE|spellings|English name|gender|relation\n"
+        "\nROLE is MC for the main character, NPC for everybody else.\n"
+        "\nTHE MAIN CHARACTER. Exactly one, and the opening of the video is "
+        "where to find them: this genre states the hero's situation in its "
+        "first few lines and the story is told from inside their head "
+        "afterwards. The main character is the one the narration is ABOUT - "
+        "whose thoughts you are given, who other characters address directly. "
+        "They are usually never named in the narration itself, only when "
+        "somebody speaks to them, so read the dialogue for it. Output their "
+        "line first. If the story really is about no one in particular, output "
+        "no MC line at all rather than guessing.\n"
+        "\nSPELLINGS. The recogniser guesses at homophones, so ONE person "
+        "arrives under two or three spellings, and a familiar form of a name "
+        "is another. List every spelling for that character separated by "
+        "commas, most frequent first. This matters most for the main "
+        "character, who is addressed by more people in more ways than anyone "
+        "else. Do not put two spellings of one person on two lines - that is "
+        "what makes one character walk through the dub under three names.\n"
+        "\nGENDER is f or m. Work it out from what the story CALLS them, never "
+        "from the pronouns: this transcript's he/she are recogniser guesses "
+        "and are wrong often. A wife, mother, daughter, sister, aunt, "
+        "grandmother, madam, empress or saintess is female. A husband, father, "
+        "son, brother, uncle, grandfather, sir, lord or emperor is male. Those "
+        "words are reliable; the pronoun beside them is not.\n"
+        "\nRELATION is a few words on who they are to the main character - "
+        "'his stepsister', 'his best friend', 'the girl he loves', 'his "
+        "father'. Write it in English. If they have no relation to the main "
+        "character, say what they are instead - 'a reporter', 'the sect "
+        "elder'.\n"
+        "\nDo NOT list, however often they occur:\n"
         " - ordinary words used as a form of address - wife, husband, madam, "
         "master, host, senior, young lady. They are not names, and listing one "
         "makes the translator write \"Husband will cook the rice\" where a "
@@ -1068,83 +1208,56 @@ def build_glossary(client, segments: list[dict], model: str, src: str) -> str:
         " - figures of speech and scenery - stars in her eyes, the mountain "
         "gate - which are not characters at all;\n"
         " - anyone the story never actually names. Leave them out rather than "
-        "inventing a name: the translator will call them what the line calls "
-        "them, which is right.\n"
+        "inventing a name.\n"
         "A relationship title EARNS a place only when it is that character's "
         "actual name in the story - someone always called Aunt Yun and never "
-        "anything else. Then its English must be a name in English too "
-        "(Aunt Yun), never a bare common noun.\n"
-        "Output one per line as  original|English|gender\n"
-        "gender is f for female, m for male, or - for anything that is not a "
-        "person. Work the gender out from how the character is described and "
-        "addressed - words like mother, wife, daughter, madam, father, husband, "
-        "son, sir. Do not rely on the pronouns in the text: they are speech "
-        "recognition guesses and are often wrong.\n"
-        "The recogniser guesses at homophones, so ONE character often appears "
-        "under two or three spellings. Merge them: list the form that occurs "
-        "most, and give every variant the same English name.\n"
-        "Use the most natural English rendering of each name. "
-        "Output nothing else. If there are none, output nothing.")
-    # The opening is where a first-person narrator establishes himself, and a
-    # sample spread over the rest of the video is where the supporting cast
-    # turns up. Sampling alone misses the narrator: on a real episode it
-    # answered "third person" because every line it drew came from the middle.
-    opening = " / ".join(s["text"] for s in segments[:40])
-    user = (f"# opening of the video\n{opening}\n\n"
-            f"# spread over the rest\n{_sample(segments, 1800)}")
+        "anything else. Then its English must be a name in English too.\n"
+        "\nExample:\n"
+        "  MC|江晨,江城,小晨|Jiang Chen|m|the narrator, a student sitting his exams\n"
+        "  NPC|顾清涵|Gu Qinghan|f|his stepsister, the girl he confessed to\n"
+        "  NPC|宋景年,宋锦年|Song Jingnian|m|his best friend, who betrays him\n"
+        "\nOutput nothing but those lines.")
+    # The opening is where the main character is established and a sample
+    # spread over the rest is where the supporting cast turns up. Sampling
+    # alone misses the lead: on a real episode every line it drew came from the
+    # middle, and it answered "third person". The opening is given more of it
+    # now, because identifying the MC correctly is what the rest hangs on.
+    opening = " / ".join(s["text"] for s in segments[:55])
+    user = (f"# opening of the video - the main character is established here\n"
+            f"{opening}\n\n"
+            f"# spread over the rest of the video\n{_sample(segments, 1800)}")
     try:
         raw = _strip_think(_call(client, model, system, user, 600, TokenBudget()))
     except Exception:
         return ""
 
-    entries = []
-    narrator = ""
+    mc, npcs = None, []
     for line in raw.splitlines():
         line = line.strip().lstrip("-*• ")
-        if "|" not in line or len(line) > 110:
+        if "|" not in line or len(line) > 200:
             continue
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 2 or not parts[0] or not parts[1]:
+        if len(parts) < 3:
             continue
-        if parts[0].upper() == "NARRATOR":
-            # A pronoun here means the model answered the question with the
-            # word the narration is written in rather than with a character.
-            # "The narrator is you" is worse than no answer: it reads as a
-            # licence for exactly the second person the brief is trying to
-            # remove, so it is dropped and the source heuristic below decides.
-            if parts[1] not in ("-", "?") and not _is_pronoun(parts[1], parts[1]):
-                narrator = parts[1]
+        role = parts[0].upper()
+        if role not in ("MC", "NPC"):
             continue
-        if _is_pronoun(parts[0], parts[1]) or _is_generic(parts[0], parts[1]):
+        spellings = [a.strip() for a in parts[1].split(",") if a.strip()]
+        english = parts[2]
+        if not spellings or not english:
             continue
-        sex = (parts[2][:1].lower() if len(parts) > 2 else "")
-        tag = {"f": " (female)", "m": " (male)"}.get(sex, "")
-        entries.append(f"{parts[0]}={parts[1]}{tag}")
-
-    cast = ", ".join(entries[:40])
-    # The cast list is one cheap call and it does not reliably come back with a
-    # NARRATOR line - on the clips here it omitted one as often as not, and the
-    # anchor below is the single strongest point-of-view instruction in the
-    # whole brief. The source is the more dependable witness (see _is_narrated),
-    # so when it says this is the hero's own life being narrated at him, the
-    # anchor goes in whether or not the model managed to name him.
-    if not narrator and _is_narrated(segments, "", src):
-        narrator = ""
-        anchor = ("The narration is the MAIN CHARACTER telling his own story. "
-                  "He is never named in it - the source writes his life at him "
-                  "in the second person, and every one of those lines is him "
-                  "speaking as \"I\". This is the narrator and main character "
-                  "of the whole video, and no other character narrates.\n")
-    elif narrator:
-        # Naming the narrator is what lets a batch tell "I" from "he": every
-        # line of narration belongs to this character, and no other character
-        # may be given his voice.
-        anchor = (f"The narrator and main character is {narrator}. Narration is "
-                  f"{narrator} speaking as \"I\". When another character is the "
-                  f"subject, name them or use he/she.\n")
-    else:
-        anchor = ""
-    return anchor + cast
+        if _is_pronoun(spellings[0], english) or _is_generic(spellings[0], english):
+            continue
+        relation = parts[4].strip() if len(parts) > 4 else ""
+        sex = _settle_gender(parts[3] if len(parts) > 3 else "",
+                             relation, spellings)
+        entry = {"names": spellings[:6], "en": english,
+                 "sex": sex, "relation": relation[:80]}
+        if role == "MC" and mc is None:
+            mc = entry
+        else:
+            npcs.append(entry)
+    return _format_cast(mc, npcs, segments, src)
 
 
 def build_system(src: str, glossary: str = "") -> str:
@@ -1160,15 +1273,29 @@ def build_system(src: str, glossary: str = "") -> str:
 
 
 def cast_list(client, segments: list[dict], model: str, src: str,
-              cache_dir: Path | None = None) -> str:
-    """The cast list for a transcript, read from cache when one was made."""
+              cache_dir: Path | None = None,
+              fallbacks: tuple[str, ...] = ()) -> str:
+    """The cast list for a transcript, read from cache when one was made.
+
+    Tries the other models before giving up. The chart is one cheap call, but
+    everything downstream leans on it - who the lead is, which name each
+    spelling belongs to, which pronoun each character takes - so coming back
+    empty because one model happened to be out of allowance for the day costs
+    the whole video its point of view and its genders.
+    """
     cache = (cache_dir / "glossary.txt") if cache_dir else None
     if cache is not None and cache.is_file():
         try:
             return cache.read_text(encoding="utf-8")
         except OSError:
             pass
-    glossary = build_glossary(client, segments, model, src)
+    glossary = ""
+    for m in (model, *fallbacks):
+        if not m:
+            continue
+        glossary = build_glossary(client, segments, m, src)
+        if glossary:
+            break
     if cache is not None and glossary:
         try:
             cache.write_text(glossary, encoding="utf-8")

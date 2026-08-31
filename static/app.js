@@ -667,6 +667,21 @@ async function fillSettings(root) {
         <label for="burn">Burn English subtitles into the picture
           <div class="hint">Permanently draws subtitles on the video. Slower, since the
             video must be re-encoded. Subtitles are available as a toggle either way.</div></label>
+      </div>
+
+      <h4>Downloads</h4>
+      <div class="field">
+        <label for="ytbrowser">Sign in to YouTube as</label>
+        <select id="ytbrowser">
+          <option value=""${cfg.ytdlp_browser ? '' : ' selected'}>Don't use a browser's cookies</option>
+          ${['chrome', 'brave', 'edge', 'firefox', 'opera', 'vivaldi', 'chromium']
+            .map((b) => `<option value="${b}"${cfg.ytdlp_browser === b ? ' selected' : ''}>${
+              b[0].toUpperCase() + b.slice(1)}</option>`).join('')}
+        </select>
+        <div class="hint">YouTube now asks many downloads to prove they are not a bot.
+          Picking a browser you are signed in to YouTube with gets past it.
+          <b>That browser must be closed</b> when you download - its cookies cannot
+          be read while it is running.</div>
       </div>`;
 
   saveBtn.disabled = false;
@@ -844,6 +859,7 @@ async function fillSettings(root) {
       keep_original_audio: root.querySelector('#keeporig').checked,
       original_audio_gain: parseFloat(gain.value),
       burn_subtitles: root.querySelector('#burn').checked,
+      ytdlp_browser: root.querySelector('#ytbrowser')?.value || '',
     };
     const key = keyInput.value.trim();
     if (key) payload.groq_api_key = key;

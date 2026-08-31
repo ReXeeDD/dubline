@@ -95,6 +95,18 @@ DEFAULTS = {
     "original_audio_gain": 0.06,   # background bed level when it is enabled
     "max_speedup": 1.7,            # hard cap on time-compressing a dub line
     "burn_subtitles": False,
+    # Which browser yt-dlp should borrow cookies from, or "" for none.
+    #
+    # YouTube now answers an unauthenticated request for many videos with
+    # "Sign in to confirm you're not a bot", and no yt-dlp version gets past
+    # that on its own - the copy here is already the current release. Reading
+    # the cookies of a browser you are signed in with is yt-dlp's own answer to
+    # it, and it is what turns the bot check back into a normal download:
+    # measured on a blocked link, 0 usable formats without it and 47 with.
+    #
+    # The cookie database is locked while that browser is running, so pick one
+    # that is closed - Chrome open in the foreground cannot be read.
+    "ytdlp_browser": "",
 }
 
 

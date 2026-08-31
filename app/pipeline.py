@@ -264,8 +264,9 @@ def retranslate(vid: str, opts: dict) -> None:
             if opts.get("llm_provider") != "local" else []
         translate.polish(clients, segments,
                          [llm.translation_model(opts)] + helpers, lang,
-                         translate.cast_list(clients[0], segments,
-                                             llm.helper_model(opts), lang, work),
+                         translate.cast_list(
+                             clients[0], segments, llm.helper_model(opts), lang,
+                             work, fallbacks=(llm.translation_model(opts),)),
                          progress)
         save(segments, force=True)
 
@@ -354,8 +355,13 @@ def _stream_dub(vid: str, src: Path, segments: list[dict], duration: float,
     # One cast list for the whole video, settled before the first line is
     # translated. Building it per window would let the same character be
     # spelled differently in different parts of the same episode.
-    glossary = translate.cast_list(clients[0], segments,
-                                   llm.helper_model(opts), lang, work)
+    # The helper runs it so the primary model starts translating on a full
+    # budget - but if the helper is out of allowance the primary does it
+    # instead, because a video with no chart has no point of view and no
+    # genders.
+    glossary = translate.cast_list(clients[0], segments, llm.helper_model(opts),
+                                   lang, work,
+                                   fallbacks=(llm.translation_model(opts),))
     system = translate.build_system(lang, glossary)
 
     bounds = _window_bounds(segments, duration)
