@@ -42,9 +42,23 @@ def _conn() -> sqlite3.Connection:
     return c
 
 
+# Columns added after the first release. SQLite has no "add column if missing",
+# and CREATE TABLE IF NOT EXISTS silently does nothing on an existing database,
+# so every one of these has to be applied by hand against a library that is
+# already full of videos.
+MIGRATIONS = [
+    ("position", "REAL DEFAULT 0"),      # where the viewer stopped watching
+    ("watched_at", "REAL DEFAULT 0"),    # when they last watched it
+]
+
+
 def init() -> None:
     with _lock, _conn() as c:
         c.executescript(SCHEMA)
+        have = {r["name"] for r in c.execute("PRAGMA table_info(videos)")}
+        for name, decl in MIGRATIONS:
+            if name not in have:
+                c.execute(f"ALTER TABLE videos ADD COLUMN {name} {decl}")
 
 
 def vdir(vid: str) -> Path:
@@ -54,6 +68,13 @@ def vdir(vid: str) -> Path:
 
 
 def create(title: str, original_name: str, **fields) -> str:
+    """Add a row. `status`, `stage` and `progress` may be overridden.
+
+    They used to be hard-coded to "queued", which silently discarded whatever
+    the caller asked for - so a video created as a download appeared as a video
+    waiting to be dubbed, on the wrong shelf, and would have been picked up by
+    the queue on the next restart.
+    """
     vid = uuid.uuid4().hex[:12]
     now = time.time()
     with _lock, _conn() as c:
@@ -61,7 +82,9 @@ def create(title: str, original_name: str, **fields) -> str:
             "INSERT INTO videos (id, title, status, stage, progress, created_at,"
             " updated_at, source_lang, voice, asr_model, llm_model, original_name)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (vid, title, "queued", "Waiting to start", 0, now, now,
+            (vid, title, fields.get("status") or "queued",
+             fields.get("stage") or "Waiting to start",
+             int(fields.get("progress") or 0), now, now,
              fields.get("source_lang"), fields.get("voice"),
              fields.get("asr_model"), fields.get("llm_model"), original_name),
         )
@@ -78,6 +101,19 @@ def update(vid: str, **fields) -> None:
     cols = ", ".join(f"{k}=?" for k in fields)
     with _lock, _conn() as c:
         c.execute(f"UPDATE videos SET {cols} WHERE id=?", (*fields.values(), vid))
+
+
+def set_position(vid: str, at: float) -> None:
+    """Remember where the viewer stopped watching.
+
+    Deliberately not update(): that stamps updated_at, which the player uses as
+    the cache-buster on the video and subtitle URLs. Writing it every few
+    seconds while someone watches would keep changing the address of the file
+    they are in the middle of.
+    """
+    with _lock, _conn() as c:
+        c.execute("UPDATE videos SET position=?, watched_at=? WHERE id=?",
+                  (round(max(0.0, at), 1), time.time(), vid))
 
 
 def get(vid: str) -> dict | None:

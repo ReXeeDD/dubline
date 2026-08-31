@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -202,6 +203,204 @@ def _quality_checks() -> None:
           "nguoi" in translate.PRONOUN_NOTES.get("vi", "")
           and translate.LANG_NAMES.get("vi") == "Vietnamese")
 
+    # The cast list is injected into the brief under "use these spellings
+    # exactly", so anything on it is a direct instruction. A pronoun there is
+    # worse than useless: "ni=you" tells the translator to write the very
+    # second-person narration that rule 6 spends a paragraph forbidding, and
+    # being concrete it wins. This is what the point-of-view drift traced back
+    # to on a real clip.
+    check("a pronoun never reaches the cast list",
+          translate._is_pronoun("你", "you")
+          and translate._is_pronoun("ngươi", "You")
+          and not translate._is_pronoun("云娘", "Yun Niang"))
+    # Common nouns are the other way a cast list does damage: "fu jun=Husband"
+    # is what produced "Husband will cook for you" where a person says "I".
+    check("a form of address is not mistaken for a name",
+          translate._is_generic("娘子", "Wife")
+          and translate._is_generic("三女", "Three Daughters")
+          and not translate._is_generic("云娘", "Yun Niang"))
+    check("an untranslated cast entry is dropped",
+          translate._is_generic("主人", "主人"),
+          "it would put source script into an all-English brief")
+    check("the brief covers forms of address and terms of art",
+          "FORMS OF ADDRESS" in translate.SYSTEM
+          and "poll tax" in translate.SYSTEM
+          and "Husband will make you food" in translate.SYSTEM)
+
+    # Only ever penalising an over-long line teaches the repair pass one move,
+    # and it will cut the content out of a line to make the number go down.
+    # This is the real case that showed it: a poll-tax exchange plus a reply
+    # collapsed into three words, filling 30 characters of a 78-character slot.
+    dropped = {"id": 0, "start": 0.0, "end": 5.2,
+               "text": "可不是交三人的人头睡就行是需要叠加的这我知道你点头表示明白知道你还选三个",
+               "en": "I nodded to show I understood."}
+    kept = {"id": 1, "start": 0.0, "end": 5.4,
+            "text": "无土王里长愤怒呵斥看向你的目光恨铁不成钢对此你有些无奈可又不知道如何去解释",
+            "en": "The village head scolded me, disappointed. I felt helpless "
+                  "but couldn't explain."}
+    terse = {"id": 2, "start": 0.0, "end": 1.5,
+             "text": "你好吗", "en": "Are you all right?"}
+    check("a line that dropped its content is caught",
+          translate._dropped_content(dropped),
+          f"{len(dropped['en'])} chars where {translate._budget_chars(dropped)} fit")
+    check("a full line is left alone", not translate._dropped_content(kept))
+    check("a genuinely short line is left alone",
+          not translate._dropped_content(terse),
+          "re-asking for these is how a repair pass makes good work worse")
+    check("the repair brief knows shortening is not always the fix",
+          "too SHORT" in translate.POLISH_SYSTEM
+          and "Shortening a line that is already too short" in translate.POLISH_SYSTEM)
+
+    # A reasoning model's reply allowance is doubled to leave room for the
+    # thinking, which puts even a plain 30-line batch past the 8000-token
+    # minute. The scheduler used to merge those batches UP to 60 lines, so the
+    # request was refused, split in two, and then immediately rejoined by the
+    # same merge - split, merge, split, merge, with no request ever sent and no
+    # error ever raised. Seen as a dub frozen at "Translating line 91 of 150".
+    sched = [{"id": i, "start": i * 5.0, "end": i * 5.0 + 5.0,
+              "text": "甲" * 38, "en": ""} for i in range(150)]
+    system = translate.build_system("zh", "")
+    head = 8000
+
+    def plan(reasoning):
+        """Run the scheduler's job bookkeeping with no API calls."""
+        translate._REASONING["selftest-model"] = reasoning
+        jobs = [(i, min(i + translate.BATCH, len(sched)))
+                for i in range(0, len(sched), translate.BATCH)]
+        sent = []
+        for _ in range(400):
+            if not jobs:
+                break
+            lo, hi = jobs.pop(0)
+            if translate._REASONING.get("selftest-model") == "low":
+                while (jobs and jobs[0][0] == hi
+                       and (hi - lo) < translate.BATCH * 2):
+                    if translate._projected_cost(system, sched, lo, jobs[0][1],
+                                                 "selftest-model") > head:
+                        break
+                    hi = jobs.pop(0)[1]
+            while (hi - lo) > 1 and translate._projected_cost(
+                    system, sched, lo, hi, "selftest-model") > head:
+                mid = lo + (hi - lo) // 2
+                jobs.insert(0, (mid, hi))
+                hi = mid
+            sent.append((lo, hi))
+        translate._REASONING.pop("selftest-model", None)
+        return jobs, sent
+
+    left, sent = plan("low")
+    check("a reasoning model's batches terminate", not left,
+          f"{len(sent)} requests, biggest {max(h - l for l, h in sent)} lines")
+    check("every line is still covered",
+          sum(h - l for l, h in sent) == len(sched),
+          f"{sum(h - l for l, h in sent)}/{len(sched)}")
+    check("no batch is sent that cannot fit the minute",
+          all(translate._projected_cost(system, sched, l, h, "absent") <= head
+              for l, h in sent))
+    left, sent = plan(None)
+    check("a plain model still takes whole batches", not left
+          and max(h - l for l, h in sent) == translate.BATCH,
+          f"{len(sent)} requests of {translate.BATCH}")
+
+    # One bucket running out of its DAILY allowance must cost that bucket, not
+    # the video. The others have their own allowance and the work is ordinary
+    # work - but a stream used to leave the moment the queue looked empty, and
+    # the queue looks empty while an exhausted stream is still holding the
+    # batch it is about to hand back. Nobody was left to take it, and
+    # translate() then failed the whole run for "daily token limit is used up"
+    # while a model with budget sat idle. This drives the real _worker.
+    import threading as _th
+
+    def handoff(dead_model):
+        segs2 = [{"id": i, "start": i * 3.0, "end": i * 3.0 + 3.0,
+                  "text": "x" * 20, "en": ""} for i in range(120)]
+        jobs = [(i, min(i + translate.BATCH, len(segs2)))
+                for i in range(0, len(segs2), translate.BATCH)]
+        lock = _th.Lock()
+        state = {"done": 0, "error": None, "checkpoint": None,
+                 "holders": 0, "report": lambda: None}
+        budgets = {m: translate.TokenBudget() for m in ("alive", "dead")}
+        real = translate._run_batch
+
+        def fake(client, model, system, segments, lo, hi, budget):
+            time.sleep(0.005)
+            if model == dead_model:
+                budget.exhausted = "resets in 17m30s"
+                raise translate.Exhausted(f"{model}: out for the day")
+            return {s["id"]: "line" for s in segments[lo:hi]}
+
+        translate._run_batch = fake
+        try:
+            threads = [_th.Thread(target=translate._worker,
+                                  args=(None, m, "sys", segs2, jobs, lock,
+                                        state, budgets[m]))
+                       for m in ("alive", "dead") for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        finally:
+            translate._run_batch = real
+        return jobs, state, segs2
+
+    left, state, segs2 = handoff("dead")
+    check("a model out of daily budget hands its work to the others",
+          not left and state["error"] is None,
+          f"{len(left)} batches stranded")
+    check("every line is still translated after the handover",
+          all(s["en"] for s in segs2),
+          f"{sum(1 for s in segs2 if s['en'])}/{len(segs2)} lines")
+    check("no stream is left holding a batch",
+          state["holders"] == 0, f"holders={state['holders']}")
+    check("a per-day limit is not retried like a transient error",
+          "except Exhausted" in inspect.getsource(translate._run_batch),
+          "retrying spends two more requests proving what the first reply said")
+    # Running out mid-window is the common way this run ends, and the lines
+    # already translated in that window were paid for.
+    from app import pipeline as _pipe
+    src = inspect.getsource(_pipe.process)
+    _, _, after = src.partition("except Exception as exc:")
+    check("a failed run keeps the translation it already paid for",
+          "save_segments" in after,
+          "the streaming path only saves at a window boundary")
+
+    # What the voice is handed is not what the viewer reads. An English voice
+    # has no rule for a Vietnamese tone mark or a non-breaking hyphen, and it
+    # reads a leading ellipsis as a long pause at the moment it should be
+    # talking. The subtitle keeps the correct spelling either way.
+    speech = tts._clean_for_speech
+    check("a Vietnamese name is made pronounceable",
+          speech("Loan Phượng God Form.") == "Loan Phuong God Form.",
+          "159 lines across the library carry one")
+    check("the non-breaking hyphen becomes a real one",
+          speech("a god‑tier skill") == "a god-tier skill")
+    check("a line does not open on an ellipsis",
+          speech("...that I was their husband.") == "that I was their husband.")
+    check("curly quotes are folded down",
+          speech("“Isn’t it?”") == '"Isn\'t it?"')
+    check("the subtitle itself is untouched",
+          "Phượng" in "Loan Phượng God Form.",
+          "only the spoken copy is folded - the viewer reads the real spelling")
+
+    # Whisper caps nothing, so a long unbroken passage arrives as one enormous
+    # segment - 30 seconds at worst across this library. Everything downstream
+    # measures a line by its own start and end, so that one segment becomes a
+    # 450-character translation, one breathless utterance and an unreadable
+    # subtitle all at once.
+    long_seg = [{"id": 0, "start": 0.0, "end": 30.0, "text": "甲" * 90}]
+    pieces = asr._split_long(long_seg)
+    check("an over-long segment is split", len(pieces) > 1,
+          f"30s -> {len(pieces)} pieces")
+    check("no piece is longer than the merge cap",
+          all(p["end"] - p["start"] <= asr.MERGE_MAX_SPAN + 0.01 for p in pieces),
+          f"longest {max(p['end'] - p['start'] for p in pieces):.1f}s")
+    check("splitting keeps every character and the span",
+          "".join(p["text"] for p in pieces) == long_seg[0]["text"]
+          and abs(pieces[-1]["end"] - 30.0) < 0.01 and pieces[0]["start"] == 0.0)
+    check("a segment that already fits is untouched",
+          asr._split_long([{"id": 0, "start": 0.0, "end": 4.0,
+                            "text": "你好"}])[0]["text"] == "你好")
+
 
 def _stream_checks() -> None:
     """Section 9: watching a video while it is still being dubbed."""
@@ -375,16 +574,84 @@ def _dub_quality_checks() -> None:
         check(f"caught: {why}", bool(translate.audit([seg], cast, "zh")))
 
     clean = [
-        {"id": 5, "start": 0, "end": 6, "text": "x",
-         "en": "You should eat first, husband."},                  # real dialogue
         {"id": 6, "start": 0, "end": 6, "text": "x",
          "en": "She eyed my belongings and smiled."},
         {"id": 7, "start": 0, "end": 6, "text": "x",
          "en": "He leered at them. Never, we would rather die."},
+        # Quoted speech keeps its second person - that is where "you" belongs.
+        {"id": 8, "start": 0, "end": 6, "text": "x",
+         "en": 'She bowed. "You should eat first, husband."'},
     ]
     flagged = translate.audit(clean, cast, "zh")
     check("leaves correct lines alone", not flagged,
           f"{len(flagged)} false alarms out of {len(clean)}")
+
+    # Dialogue that carries no quotation marks cannot be told apart from
+    # narration by reading it, so it IS flagged. That is deliberate: the repair
+    # brief tells the model in as many words to leave real speech alone, and a
+    # rewrite is only kept if the audit likes it better, so a wrong flag costs
+    # a request rather than a broken line. Both halves are checked below.
+    bare = {"id": 9, "start": 0, "end": 6, "text": "x",
+            "en": "You should eat first, husband."}
+    check("unquoted dialogue is flagged rather than missed",
+          bool(translate.audit([bare], cast, "zh")),
+          "the repair brief is what protects it, not the rule")
+
+    # -- narration voice: the defect that makes the hero a stranger ---------
+    # This genre writes the hero's own life at him in the second person, and
+    # translated literally it comes out as somebody lecturing him.
+    zh = [{"id": i, "start": i * 6.0, "end": i * 6.0 + 6.0,
+           "text": "你" + "x" * 20, "en": ""} for i in range(60)]
+    check("a second-person Chinese source is recognised as narration",
+          translate._is_narrated(zh, "", "zh"))
+    third = [dict(s, text="他" + "x" * 20) for s in zh]
+    check("a third-person source is left alone",
+          not translate._is_narrated(third, "", "zh"),
+          "forcing 'I' onto a story about other people would be the worse bug")
+    check("a language with no note is left alone",
+          not translate._is_narrated(zh, "", "vi"))
+
+    narr = ("The narrator and main character is Lin. Narration is Lin speaking "
+            'as "I".')
+    leaks = [
+        "and your father chose to save the baby.",
+        "Since your parents died, you were barely getting by.",
+        "In your world you would have begged for such a woman.",
+    ]
+    for line in leaks:
+        seg = {"id": 1, "start": 0, "end": 9, "text": "x", "en": line}
+        check(f"caught: {line[:38]}...", bool(translate.audit([seg], narr, "zh")))
+
+    # Dialogue that runs across a line break has its opening quote on the line
+    # before, so neither line holds a matched pair. Both of these were flagged
+    # as narration until the quote state was carried between lines.
+    split = [
+        {"id": 1, "start": 0, "end": 9, "text": "x",
+         "en": 'Aunt Yun looked at us. "These are the bachelors from your village.'},
+        {"id": 2, "start": 9, "end": 18, "text": "x",
+         "en": 'Just the three of you." Uncle Wang nodded and smiled.'},
+    ]
+    flagged = translate.audit(split, narr, "zh")
+    check("dialogue split across two subtitles keeps its 'you'",
+          not flagged, f"{len(flagged)} false alarms")
+
+    # An opening quotation whose partner never arrives must not flip the
+    # reading of every line after it. Taken from a real scene: one unclosed
+    # quote left four following lines parsed inside-out, and the dialogue on
+    # the last of them was flagged as narration.
+    stuck = [
+        {"id": 1, "start": 0, "end": 6, "text": "x",
+         "en": 'A maid spoke behind her: "Princess, accept your fate.'},
+        {"id": 2, "start": 6, "end": 12, "text": "x",
+         "en": "Yun Jin pleaded, but the maids dressed her up anyway."},
+        {"id": 3, "start": 12, "end": 18, "text": "x",
+         "en": "They sent her to my room, and I sighed."},
+        {"id": 4, "start": 18, "end": 24, "text": "x",
+         "en": 'She could not kill me. "Do you think I would let that happen?"'},
+    ]
+    check("an unclosed quotation does not swallow the lines after it",
+          not translate.audit(stuck, narr, "zh"),
+          f"{len(translate.audit(stuck, narr, 'zh'))} false alarms")
 
     # -- a repair is kept only when it is genuinely better -------------------
     seg = {"id": 9, "start": 0.0, "end": 6.0, "text": "x",
@@ -404,6 +671,145 @@ def _dub_quality_checks() -> None:
             translate._call = real
         check(label, (out["fixed"] == 1) is expect,
               f"kept: {trial[0]['en'][:46]}")
+
+
+def _library_checks() -> None:
+    """Section 11: the library survives an upgrade and remembers where you were."""
+    import sqlite3
+    import tempfile
+    from app import library, main
+
+    print("\n11. Library upgrades and playback memory")
+
+    # A database written by an older build has none of the newer columns, and
+    # CREATE TABLE IF NOT EXISTS will not add them. Build exactly that, then
+    # open it the way the app does.
+    old_db = Path(tempfile.mkdtemp(prefix="lib_", dir=str(TMP))) / "old.db"
+    con = sqlite3.connect(old_db)
+    con.executescript("""CREATE TABLE videos (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+        stage TEXT, progress INTEGER DEFAULT 0, error TEXT, created_at REAL,
+        updated_at REAL, duration REAL DEFAULT 0, source_lang TEXT, voice TEXT,
+        asr_model TEXT, llm_model TEXT, line_count INTEGER DEFAULT 0,
+        stats TEXT, original_name TEXT);""")
+    con.execute("INSERT INTO videos (id,title,status,duration) VALUES "
+                "('old1','An older video','ready',600)")
+    con.commit()
+    con.close()
+
+    real_db = library.DB
+    try:
+        library.DB = old_db
+        library.init()
+        v = library.get("old1")
+        check("an existing library is upgraded, not replaced",
+              v is not None and v["title"] == "An older video")
+        check("the new columns are added to it",
+              v is not None and "position" in v and "watched_at" in v,
+              "position, watched_at")
+
+        before = library.get("old1")["updated_at"]
+        library.set_position("old1", 421.37)
+        after = library.get("old1")
+        check("playback position is remembered", after["position"] == 421.4,
+              f"{after['position']}s")
+        check("saving it does not touch updated_at",
+              after["updated_at"] == before,
+              "otherwise the video URL changes under a viewer every few seconds")
+        library.init()          # a second startup must be a no-op
+        check("upgrading twice is harmless", library.get("old1") is not None)
+    finally:
+        library.DB = real_db
+        shutil.rmtree(old_db.parent, ignore_errors=True)
+
+    # Unfinished work is requeued rather than failed - every stage is
+    # checkpointed, so picking it up costs only what was in flight.
+    src = inspect.getsource(main._startup)
+    check("an interrupted video is put back on the queue",
+          "POOL.submit" in src and 'status="queued"' in src)
+    # A dubbing job must never be failed by a restart. A download must, because
+    # nothing here can resume one: yt-dlp owns that and the partial file may be
+    # anything. Both live in the same loop, so this checks that the only
+    # fail-on-restart path is the one guarded by the downloading status, rather
+    # than checking for the message text - which the download branch also uses.
+    head, _, tail = src.partition('if v["status"] == "downloading"')
+    check("a dubbing job is not marked failed on restart",
+          'status="failed"' not in head)
+    check("an interrupted download is failed, not left spinning",
+          bool(tail) and 'status="failed"' in tail.split("continue")[0])
+    check("the oldest waiting video is resumed first",
+          "sorted(" in src and "created_at" in src)
+
+
+def _download_checks() -> None:
+    """Section 12: picking a quality from a link, without touching the network."""
+    import json as _json
+    from app import download, library, main
+
+    print("\n12. Choosing what to download")
+
+    # A cut-down copy of what yt-dlp reports for a real YouTube video: several
+    # codecs at each size, audio-only tracks, and the -drc duplicates.
+    fake = {"title": "An episode", "duration": 3605, "uploader": "someone",
+            "formats": [
+                {"format_id": "139", "ext": "m4a", "vcodec": "none",
+                 "acodec": "mp4a.40.5", "abr": 48.8, "filesize": 22_000_000},
+                {"format_id": "139-drc", "ext": "m4a", "vcodec": "none",
+                 "acodec": "mp4a.40.5", "abr": 48.8, "filesize": 22_000_000},
+                {"format_id": "140", "ext": "m4a", "vcodec": "none",
+                 "acodec": "mp4a.40.2", "abr": 129.5, "filesize": 58_000_000},
+                {"format_id": "251", "ext": "webm", "vcodec": "none",
+                 "acodec": "opus", "abr": 126.3, "filesize": 57_000_000},
+                {"format_id": "136", "ext": "mp4", "height": 720, "fps": 30,
+                 "vcodec": "avc1.4d401f", "acodec": "none", "tbr": 431,
+                 "filesize": 194_000_000},
+                {"format_id": "247", "ext": "webm", "height": 720, "fps": 30,
+                 "vcodec": "vp9", "acodec": "none", "tbr": 918,
+                 "filesize": 413_000_000},
+                {"format_id": "135", "ext": "mp4", "height": 480, "fps": 30,
+                 "vcodec": "avc1.4d401f", "acodec": "none", "tbr": 190,
+                 "filesize": 85_000_000},
+                {"format_id": "160", "ext": "mp4", "height": 144, "fps": 30,
+                 "vcodec": "avc1.4d400c", "acodec": "none", "tbr": 35,
+                 "filesize": 15_000_000},
+                {"format_id": "232", "ext": "mp4", "height": 720, "fps": 30,
+                 "vcodec": "avc1.4D401F", "acodec": "none", "tbr": 2073},
+            ]}
+
+    real_run = download._run
+    try:
+        download._run = lambda *a, **k: _json.dumps(fake)
+        got = download.probe("https://example.invalid/watch")
+    finally:
+        download._run = real_run
+
+    by = {q["label"]: q for q in got["qualities"]}
+    check("one row per picture size, not one per codec",
+          sorted(by) == ["144p", "480p", "720p"], ", ".join(sorted(by)))
+    check("h264 wins over the bigger vp9 at the same size",
+          by["720p"]["format"].startswith("136+"), by["720p"]["format"])
+    check("a stream with no size is not offered",
+          "232" not in by["720p"]["format"],
+          "yt-dlp cannot cost it up front, so it cannot be shown")
+    check("a watchable size gets the good audio",
+          by["480p"]["format"] == "135+140", by["480p"]["format"])
+    check("144p is not paired with the biggest audio track",
+          by["144p"]["format"] == "160+139", by["144p"]["format"])
+    check("m4a is chosen over opus so the result is still an mp4",
+          all(q["ext"] == "mp4" for q in got["qualities"]))
+    check("the -drc duplicates are ignored",
+          all("-drc" not in q["format"] for q in got["qualities"]))
+    check("size covers picture and sound together",
+          by["480p"]["size"] == 85_000_000 + 58_000_000,
+          f"{by['480p']['size'] / 1048576:.0f} MB")
+
+    # A downloaded video must land on its own shelf, not in the dubbing queue.
+    src = inspect.getsource(main._download_job)
+    check("a finished download is not queued for dubbing",
+          'status="downloaded"' in src and "pipeline.process" not in src)
+    check("the row is created in the state the caller asked for",
+          library.create.__doc__ and "may be overridden" in library.create.__doc__,
+          "create() used to force every new row to 'queued'")
 
 
 def main() -> None:
@@ -544,6 +950,8 @@ def main() -> None:
     _quality_checks()
     _stream_checks()
     _dub_quality_checks()
+    _library_checks()
+    _download_checks()
 
     print("\n" + "=" * 62)
     print("  RESULT:", "ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")

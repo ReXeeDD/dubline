@@ -259,9 +259,9 @@ async function openUpload() {
       ${cfg.has_key ? '' : `<div class="alert">No Groq API key set yet.
         Add it in Settings before uploading, or processing will fail.</div>`}
       <div class="drop" id="drop">
-        <input type="file" id="file" accept="video/*" hidden>
-        <b>Choose a video or drag it here</b>
-        <span>MP4, MKV, WEBM, MOV, AVI and more</span>
+        <input type="file" id="file" accept="video/*" multiple hidden>
+        <b>Choose videos or drag them here</b>
+        <span>MP4, MKV, WEBM, MOV, AVI and more - pick several to queue a batch</span>
       </div>
       <div class="field" style="margin-top:18px">
         <label for="title">Title</label>
@@ -287,27 +287,41 @@ async function openUpload() {
       const fileInput = root.querySelector('#file');
       const go = root.querySelector('#go');
       const titleInput = root.querySelector('#title');
-      let chosen = null;
+      let chosen = [];
 
-      const pick = (f) => {
-        if (!f) return;
-        chosen = f;
+      // Several files queue behind each other: only one video is processed at a
+      // time anyway, so choosing a whole season and walking away is the useful
+      // shape. A batch takes each file's own name - one Title box cannot name
+      // seven episodes.
+      const pick = (files) => {
+        chosen = [...(files || [])].filter((f) => f && f.size);
+        if (!chosen.length) return;
         drop.classList.add('has-file');
-        drop.innerHTML = `<b>${esc(f.name)}</b><span>${(f.size / 1048576).toFixed(1)} MB - click to change</span>`;
+        const mb = chosen.reduce((n, f) => n + f.size, 0) / 1048576;
+        drop.innerHTML = chosen.length === 1
+          ? `<b>${esc(chosen[0].name)}</b><span>${mb.toFixed(1)} MB - click to change</span>`
+          : `<b>${chosen.length} videos</b><span>${mb.toFixed(0)} MB total - `
+            + `they will be dubbed one after another</span>`;
         drop.append(fileInput);
-        if (!titleInput.value) titleInput.value = f.name.replace(/\.[^.]+$/, '');
+        titleInput.disabled = chosen.length > 1;
+        titleInput.placeholder = chosen.length > 1
+          ? 'Each video keeps its own filename' : 'Taken from the filename';
+        if (chosen.length > 1) titleInput.value = '';
+        else if (!titleInput.value) titleInput.value = chosen[0].name.replace(/\.[^.]+$/, '');
+        go.textContent = chosen.length > 1
+          ? `Start dubbing ${chosen.length} videos` : 'Start dubbing';
         go.disabled = false;
       };
 
       drop.onclick = () => fileInput.click();
-      fileInput.onchange = () => pick(fileInput.files[0]);
+      fileInput.onchange = () => pick(fileInput.files);
       ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => {
         e.preventDefault(); drop.classList.add('over');
       }));
       ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => {
         e.preventDefault(); drop.classList.remove('over');
       }));
-      drop.addEventListener('drop', (e) => pick(e.dataTransfer.files[0]));
+      drop.addEventListener('drop', (e) => pick(e.dataTransfer.files));
 
       root.querySelector('#prev').onclick = (e) => {
         e.preventDefault();
@@ -315,21 +329,15 @@ async function openUpload() {
       };
       root.querySelector('[data-cancel]').onclick = closeModal;
 
-      go.onclick = () => {
-        if (!chosen) return;
+      // One file at a time, in order. Sending them all at once would have the
+      // browser split the upstream between them, so nothing finishes early and
+      // the queue cannot start on the first video until the last has landed.
+      const sendOne = (file, index) => new Promise((resolve, reject) => {
         const fd = new FormData();
-        fd.append('file', chosen);
-        fd.append('title', titleInput.value);
+        fd.append('file', file);
+        fd.append('title', chosen.length > 1 ? '' : titleInput.value);
         fd.append('voice', root.querySelector('#voice').value);
         fd.append('source_language', root.querySelector('#lang').value);
-
-        const state = root.querySelector('#upstate');
-        go.disabled = true;
-        root.querySelector('[data-cancel]').disabled = true;
-        state.innerHTML = `<div class="progress-wrap"><div class="bar"><i style="width:0%"></i></div>
-          <div class="stage">Uploading...</div></div>`;
-        const barFill = state.querySelector('.bar > i');
-        const stage = state.querySelector('.stage');
 
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/upload');
@@ -337,28 +345,148 @@ async function openUpload() {
           if (!e.lengthComputable) return;
           const pct = Math.round((e.loaded / e.total) * 100);
           barFill.style.width = pct + '%';
-          stage.textContent = `Uploading ${pct}% (${(e.loaded / 1048576).toFixed(0)} of ${(e.total / 1048576).toFixed(0)} MB)`;
+          const of = chosen.length > 1 ? ` - file ${index + 1} of ${chosen.length}` : '';
+          stage.textContent = `Uploading ${esc(file.name).slice(0, 40)}${of}`
+            + ` ${pct}% (${(e.loaded / 1048576).toFixed(0)}`
+            + ` of ${(e.total / 1048576).toFixed(0)} MB)`;
         };
         xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            closeModal();
-            toast('Upload complete - dubbing started');
-            location.hash = '#/';
-            render();
-          } else {
-            let msg = 'Upload failed';
-            try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (e) { /* */ }
-            state.innerHTML = `<div class="alert">${esc(msg)}</div>`;
-            go.disabled = false;
-            root.querySelector('[data-cancel]').disabled = false;
-          }
+          if (xhr.status >= 200 && xhr.status < 300) return resolve();
+          let msg = 'Upload failed';
+          try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (e) { /* */ }
+          reject(new Error(`${file.name}: ${msg}`));
         };
-        xhr.onerror = () => {
-          state.innerHTML = '<div class="alert">Upload failed - is the server still running?</div>';
-          go.disabled = false;
-        };
+        xhr.onerror = () => reject(new Error('Upload failed - is the server still running?'));
         xhr.send(fd);
+      });
+
+      let barFill; let stage;
+      go.onclick = async () => {
+        if (!chosen.length) return;
+        const state = root.querySelector('#upstate');
+        go.disabled = true;
+        root.querySelector('[data-cancel]').disabled = true;
+        state.innerHTML = `<div class="progress-wrap"><div class="bar"><i style="width:0%"></i></div>
+          <div class="stage">Uploading...</div></div>`;
+        barFill = state.querySelector('.bar > i');
+        stage = state.querySelector('.stage');
+
+        const failed = [];
+        for (let i = 0; i < chosen.length; i++) {
+          try {
+            await sendOne(chosen[i], i);
+          } catch (err) {
+            failed.push(err.message);
+          }
+        }
+
+        if (failed.length === chosen.length) {
+          state.innerHTML = `<div class="alert">${esc(failed[0])}</div>`;
+          go.disabled = false;
+          root.querySelector('[data-cancel]').disabled = false;
+          return;
+        }
+        closeModal();
+        const sent = chosen.length - failed.length;
+        toast(failed.length
+          ? `${sent} of ${chosen.length} uploaded - ${failed.length} failed`
+          : (sent > 1 ? `${sent} videos queued for dubbing`
+                      : 'Upload complete - dubbing started'), !!failed.length);
+        location.hash = '#/';
+        render();
       };
+    },
+  });
+}
+
+/* -------------------------------------------------------- download --- */
+/* Paste a link, see what it offers, pick one. Nothing is dubbed here: the
+   video lands on the Downloads shelf and waits to be sent for translation. */
+function openDownload() {
+  modal({
+    title: 'Download from a link',
+    body: `
+      <div class="field">
+        <label for="url">Video link</label>
+        <input type="text" id="url" placeholder="https://..." autocomplete="off" spellcheck="false">
+        <div class="hint">Paste the address of the video page.</div>
+      </div>
+      <div id="dlinfo"></div>`,
+    footer: `<button class="btn ghost" data-cancel>Cancel</button>
+             <button class="btn primary" id="fetch">Find qualities</button>`,
+    onMount(root) {
+      const urlBox = root.querySelector('#url');
+      const info = root.querySelector('#dlinfo');
+      const btn = root.querySelector('#fetch');
+      root.querySelector('[data-cancel]').onclick = closeModal;
+      setTimeout(() => urlBox.focus(), 60);
+
+      let found = null;
+
+      const look = async () => {
+        const url = urlBox.value.trim();
+        if (!url) return;
+        btn.disabled = true;
+        btn.textContent = 'Looking...';
+        info.innerHTML = '<div class="hint" style="padding:14px 0">Reading the link - this takes a few seconds.</div>';
+        try {
+          found = await jsonPost('/api/download/probe', { url });
+        } catch (e) {
+          info.innerHTML = `<div class="alert">${esc(e.message)}</div>`;
+          btn.disabled = false;
+          btn.textContent = 'Find qualities';
+          return;
+        }
+        if (!found.qualities.length) {
+          info.innerHTML = '<div class="alert">No downloadable video streams at that link.</div>';
+          btn.disabled = false;
+          btn.textContent = 'Find qualities';
+          return;
+        }
+        // The largest picture is preselected; it is nearly always what is
+        // wanted, and the rest are one click away.
+        info.innerHTML = `
+          <div class="found">
+            <b>${esc(found.title)}</b>
+            <span>${found.duration ? hhmmss(found.duration) : ''}${
+              found.uploader ? ` &middot; ${esc(found.uploader)}` : ''}</span>
+          </div>
+          <div class="quals">
+            ${found.qualities.map((q, i) => `
+              <label class="qual">
+                <input type="radio" name="q" value="${i}"${i === 0 ? ' checked' : ''}>
+                <b>${q.label}</b>
+                <span>${esc(q.vcodec)} &middot; ${q.abr}k audio &middot; .${q.ext}</span>
+                <em>${q.size ? (q.size / 1048576).toFixed(0) + ' MB' : '?'}</em>
+                <code>${esc(q.format)}</code>
+              </label>`).join('')}
+          </div>`;
+        btn.disabled = false;
+        btn.textContent = 'Download';
+        btn.onclick = start;
+      };
+
+      const start = async () => {
+        const pickIdx = +root.querySelector('input[name="q"]:checked').value;
+        const q = found.qualities[pickIdx];
+        btn.disabled = true;
+        try {
+          await jsonPost('/api/download', {
+            url: urlBox.value.trim(), format: q.format, title: found.title,
+          });
+        } catch (e) {
+          info.innerHTML += `<div class="alert">${esc(e.message)}</div>`;
+          btn.disabled = false;
+          return;
+        }
+        closeModal();
+        toast(`Downloading ${q.label} - it lands in Downloads`);
+        location.hash = '#/downloads';
+        render();
+      };
+
+      btn.onclick = look;
+      urlBox.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); btn.click(); } };
     },
   });
 }
@@ -733,12 +861,14 @@ async function fillSettings(root) {
 /* ---------------------------------------------------------------- home --- */
 function statusChip(v) {
   if (v.status === 'ready') return '';
-  const label = { processing: 'Processing', queued: 'Queued', failed: 'Failed' }[v.status] || v.status;
+  const label = { processing: 'Processing', queued: 'Queued', failed: 'Failed',
+                  downloading: 'Downloading', downloaded: 'Not dubbed' }[v.status] || v.status;
   return `<span class="chip ${esc(v.status)}">${label}</span>`;
 }
 
 function card(v) {
-  const busy = v.status === 'processing' || v.status === 'queued';
+  const busy = v.status === 'processing' || v.status === 'queued'
+            || v.status === 'downloading';
   const thumb = v.has_thumb
     ? `<img src="/media/${v.id}/thumb.jpg" alt="" loading="lazy">`
     : `<div style="color:var(--text-3);font-size:32px">🎬</div>`;
@@ -755,6 +885,7 @@ function card(v) {
         ${thumb}
         ${statusChip(v)}
         ${v.duration ? `<span class="badge">${hhmmss(v.duration)}</span>` : ''}
+        ${watchedBar(v)}
       </div>
       <div class="card-body">
         <div style="flex:1;min-width:0">
@@ -763,12 +894,38 @@ function card(v) {
         </div>
         <button class="btn icon ghost" data-menu="${v.id}" title="Options">&#8942;</button>
       </div>
+      ${v.status === 'downloaded' ? `<div class="card-act">
+          <button class="btn primary" data-translate="${v.id}">Translate</button>
+        </div>` : ''}
       ${busy ? `<div class="progress-wrap">
           <div class="bar${v.progress ? '' : ' indeterminate'}"><i style="width:${v.progress || 0}%"></i></div>
           <div class="stage">${esc(v.stage || '')}${v.progress ? ` &middot; ${v.progress}%` : ''}</div>
           <div class="live-row">${liveButton(v)}</div>
         </div>` : ''}
     </div>`;
+}
+
+/* Badges on a transcript line saying what the pipeline had to do to it. The
+   point is to make the compromises findable: a line that was cut short is one
+   the viewer can shorten by hand, but only if they can see which one it was. */
+function lineMarks(s) {
+  const out = [];
+  if (s.dub_speedup > 1.05) out.push(`<span class="fast">${(+s.dub_speedup).toFixed(2)}x</span>`);
+  if (s.fixed) out.push('<span class="mark fixed" title="Rewritten by the repair pass">rewritten</span>');
+  if (s.clipped) out.push('<span class="mark cut" title="Too long for its slot - the end was cut">cut short</span>');
+  return out.join('');
+}
+
+/* How far into an episode the viewer got, drawn across the bottom of the
+   thumbnail the way every video service does it. At an hour a title, "did I
+   already watch this one, and where did I stop" is a real question. */
+function watchedBar(v) {
+  const at = +v.position || 0;
+  if (!(at > 20) || !(v.duration > 0)) return '';
+  const pct = Math.min(100, (at / v.duration) * 100);
+  if (pct > 97) return '<span class="seen">Watched</span>';
+  return `<div class="watched" title="Stopped at ${hhmmss(at)}">
+            <i style="width:${pct.toFixed(1)}%"></i></div>`;
 }
 
 /* Watching starts as soon as the first window of dub is published, so a long
@@ -780,43 +937,80 @@ function liveButton(v) {
       <span class="dot"></span>Watch now &middot; ${hhmmss(s)} ready</a>`;
 }
 
-async function renderHome() {
+/* A downloaded video has not been dubbed and is not on its way to being dubbed.
+   Fetching a link and spending an hour of Groq budget on it are separate
+   decisions, so they are separate shelves. */
+const DOWNLOAD_STATES = ['downloading', 'downloaded'];
+
+async function renderHome(section = 'dubbed') {
   let videos = [];
   try { videos = await api('/api/videos'); } catch (e) { toast(e.message, true); }
 
+  const mine = videos.filter((v) => DOWNLOAD_STATES.includes(v.status)
+    === (section === 'downloads'));
   const q = SEARCH.toLowerCase();
-  const shown = q ? videos.filter((v) => v.title.toLowerCase().includes(q)) : videos;
+  const shown = q ? mine.filter((v) => v.title.toLowerCase().includes(q)) : mine;
+  const waiting = videos.filter((v) => DOWNLOAD_STATES.includes(v.status)).length;
 
-  if (!videos.length) {
-    view.innerHTML = `
-      <div class="empty">
-        <h3>Your library is empty</h3>
-        <p>Upload a video and it will be transcribed, translated to English,<br>
-           re-voiced and re-synced automatically.</p>
-        <button class="btn primary" onclick="window.__upload()" style="margin-top:14px">Upload your first video</button>
-      </div>`;
-    return videos;
-  }
+  const tabs = `
+    <div class="tabs">
+      <a href="#/" class="${section === 'dubbed' ? 'on' : ''}">Dubbed</a>
+      <a href="#/downloads" class="${section === 'downloads' ? 'on' : ''}">Downloads${
+        waiting ? `<span class="pill">${waiting}</span>` : ''}</a>
+    </div>`;
+
+  const empty = section === 'downloads'
+    ? `<div class="empty">
+         <h3>No downloads yet</h3>
+         <p>Paste a video link and pick a quality. It is saved here without
+            being dubbed,<br>so you choose when to spend the translation on it.</p>
+         <button class="btn primary" onclick="window.__download()" style="margin-top:14px">Paste a link</button>
+       </div>`
+    : `<div class="empty">
+         <h3>Nothing dubbed yet</h3>
+         <p>Upload a video or paste a link, then press Translate.<br>
+            It is transcribed, translated to English, re-voiced and re-synced.</p>
+         <button class="btn primary" onclick="window.__upload()" style="margin-top:14px">Upload a video</button>
+       </div>`;
 
   view.innerHTML = `
+    ${tabs}
     <div class="section-head">
-      <h2>${q ? 'Search results' : 'Your library'}</h2>
-      <span class="count">${shown.length} of ${videos.length} video${videos.length > 1 ? 's' : ''}</span>
+      <h2>${q ? 'Search results' : section === 'downloads' ? 'Downloaded' : 'Your library'}</h2>
+      <span class="count">${shown.length} video${shown.length === 1 ? '' : 's'}</span>
     </div>
     ${shown.length ? `<div class="grid">${shown.map(card).join('')}</div>`
-      : `<div class="empty"><h3>Nothing matches "${esc(SEARCH)}"</h3></div>`}`;
+      : (q ? `<div class="empty"><h3>Nothing matches "${esc(SEARCH)}"</h3></div>` : empty)}`;
 
   view.querySelectorAll('.card').forEach((el) => {
     el.onclick = (e) => {
-      if (e.target.closest('[data-menu]')) return;
+      if (e.target.closest('[data-menu]') || e.target.closest('[data-translate]')) return;
       const { id, status } = el.dataset;
       if (status === 'ready') location.hash = `#/watch/${id}`;
       else if (status === 'failed') showFailure(id);
-      else toast('Still processing - this card updates on its own.');
+      else if (status === 'downloaded') toast('Press Translate to dub this one.');
+      else toast('Still working - this card updates on its own.');
     };
   });
   view.querySelectorAll('[data-menu]').forEach((btn) => {
     btn.onclick = (e) => { e.stopPropagation(); cardMenu(btn.dataset.menu); };
+  });
+  view.querySelectorAll('[data-translate]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      btn.disabled = true;
+      btn.textContent = 'Queued';
+      try {
+        await api(`/api/videos/${btn.dataset.translate}/translate`, { method: 'POST' });
+        toast('Queued for dubbing - it moves to Dubbed as it starts');
+        location.hash = '#/';
+        render();
+      } catch (err) {
+        toast(err.message, true);
+        btn.disabled = false;
+        btn.textContent = 'Translate';
+      }
+    };
   });
 
   return videos;
@@ -961,7 +1155,12 @@ async function renderWatch(id) {
           <div><span>Sped up to fit</span><b>${st.compressed ?? 0} lines</b></div>
           <div><span>Peak rate</span><b>${st.max_speedup_used ? st.max_speedup_used + 'x' : '1x'}</b></div>
           <div><span>Max drift</span><b>${(+(st.drift ?? 0)).toFixed(2)}s</b></div>
+          ${st.fixed ? `<div><span>Lines rewritten</span><b>${st.fixed}</b></div>` : ''}
+          ${st.clipped ? `<div><span>Trimmed to fit</span><b>${st.clipped} lines</b></div>` : ''}
         </div>
+        ${st.clipped ? `<div class="note">${st.clipped} line(s) were too long to
+          say in their slot and had to be cut short. They are marked in the
+          transcript - shorten one and re-dub if it matters.</div>` : ''}
         ${st.failed ? `<div class="alert">${st.failed} line(s) could not be voiced and are silent.</div>` : ''}
       </div>
 
@@ -972,12 +1171,12 @@ async function renderWatch(id) {
         </div>
         <div class="panel-body" id="lines">
           ${segs.map((s) => `
-            <div class="line" data-id="${s.id}" data-start="${s.start}" data-end="${s.end}">
+            <div class="line${s.clipped ? ' flagged' : ''}" data-id="${s.id}"
+                 data-start="${s.start}" data-end="${s.end}">
               <time>${hhmmss(s.start)}</time>
               <div>
                 <div class="en" data-id="${s.id}">${esc(s.en || '')}</div>
-                <div class="src">${esc(s.text || '')}${
-                  s.dub_speedup > 1.05 ? `<span class="fast">${(+s.dub_speedup).toFixed(2)}x</span>` : ''}</div>
+                <div class="src">${esc(s.text || '')}${lineMarks(s)}</div>
               </div>
             </div>`).join('')}
         </div>
@@ -1017,6 +1216,73 @@ async function renderWatch(id) {
   // The element re-applies its default rate when a new source is attached, so
   // reassert after the picture is actually there - live streams attach late.
   player.addEventListener('loadedmetadata', () => setSpeed(speed.value, false));
+
+  /* Pick up where you stopped. An episode here runs an hour, so starting from
+     zero every time is the difference between finishing one and not. Ignored
+     near the very start and the very end, where resuming is just annoying, and
+     for a live stream, which has its own idea of where to begin. */
+  let lastSaved = 0;
+  const saveAt = (at, force) => {
+    if (live || !isFinite(at)) return;
+    if (!force && Math.abs(at - lastSaved) < 5) return;
+    lastSaved = at;
+    fetch(`/api/videos/${id}/position`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ at }), keepalive: true,
+    }).catch(() => {});
+  };
+  const resumeAt = +v.position || 0;
+  if (!live && resumeAt > 20 && (!v.duration || resumeAt < v.duration - 20)) {
+    player.addEventListener('loadedmetadata', () => {
+      if (!RESUME) player.currentTime = resumeAt;
+      toast(`Resuming from ${hhmmss(resumeAt)}`);
+    }, { once: true });
+  }
+  player.addEventListener('timeupdate', () => saveAt(player.currentTime));
+  player.addEventListener('pause', () => saveAt(player.currentTime, true));
+  const onLeave = () => saveAt(player.currentTime, true);
+  window.addEventListener('pagehide', onLeave);
+  KEYS.cleanup.push(() => window.removeEventListener('pagehide', onLeave));
+
+  /* Keyboard control. Everything here is what a video player is expected to do
+     and what this one could not: without it there was no way to step back four
+     seconds to catch a line, which is the single most common thing to want
+     while checking a dub. */
+  const nudge = (d) => {
+    player.currentTime = Math.max(0, Math.min(player.duration || 1e9,
+                                              player.currentTime + d));
+    toast(`${d > 0 ? '+' : ''}${d}s`);
+  };
+  const bumpSpeed = (d) => setSpeed(Math.round((player.playbackRate + d) * 100) / 100);
+  const onKey = (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const el = document.activeElement;
+    // Never steal a key from something the viewer is typing into.
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+               || el.isContentEditable)) return;
+    const k = e.key;
+    const map = {
+      ' ': () => (player.paused ? player.play() : player.pause()),
+      k: () => (player.paused ? player.play() : player.pause()),
+      ArrowLeft: () => nudge(-5), ArrowRight: () => nudge(5),
+      j: () => nudge(-10), l: () => nudge(10),
+      ArrowUp: () => { player.volume = Math.min(1, player.volume + 0.1); },
+      ArrowDown: () => { player.volume = Math.max(0, player.volume - 0.1); },
+      m: () => { player.muted = !player.muted; },
+      f: () => (document.fullscreenElement ? document.exitFullscreen()
+                                           : player.requestFullscreen?.()),
+      '[': () => bumpSpeed(-0.05), ']': () => bumpSpeed(0.05),
+      '\\': () => setSpeed(1),
+      c: () => view.querySelector('#sub-toggle button.on')
+        ?.nextElementSibling?.click() || view.querySelector('#sub-toggle button')?.click(),
+    };
+    const act = map[k] || map[k.toLowerCase?.()];
+    if (!act) return;
+    e.preventDefault();
+    act();
+  };
+  document.addEventListener('keydown', onKey);
+  KEYS.cleanup.push(() => document.removeEventListener('keydown', onKey));
 
   if (live) startLive(id, player, v);
 
@@ -1289,11 +1555,17 @@ function startLive(id, player, v) {
 let liveTimer = null;
 let RESUME = null;
 let FINISHED = false;
+/* Listeners the watch page hangs on document and window. They have to be
+   taken down when leaving the page: this is a single page app, so every
+   visit to a video would otherwise leave another keyboard handler behind,
+   and one press would seek by five seconds per video ever opened. */
+const KEYS = { cleanup: [] };
 
 /* -------------------------------------------------------------- router --- */
 async function render() {
   if (poller) { clearInterval(poller); poller = null; }
   if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  KEYS.cleanup.splice(0).forEach((fn) => { try { fn(); } catch (e) {} });
   const old = document.getElementById('player');
   if (old && old.__hls) { try { old.__hls.destroy(); } catch (e) {} }
   const hash = location.hash || '#/';
@@ -1301,21 +1573,25 @@ async function render() {
 
   if (watch) { await renderWatch(watch[1]); return; }
 
-  const videos = await renderHome();
-  if (videos.some((v) => v.status === 'processing' || v.status === 'queued')) {
+  const videos = await renderHome(hash.startsWith('#/downloads') ? 'downloads' : 'dubbed');
+  // Downloads report progress the same way a dub does, so the same poller
+  // keeps both shelves live.
+  if (videos.some((v) => ['processing', 'queued', 'downloading'].includes(v.status))) {
     poller = setInterval(pollProgress, 1500);
   }
 }
 
 async function pollProgress() {
-  const cards = [...document.querySelectorAll('.card[data-status="processing"], .card[data-status="queued"]')];
+  const cards = [...document.querySelectorAll('.card[data-status="processing"], '
+    + '.card[data-status="queued"], .card[data-status="downloading"]')];
   if (!cards.length) { clearInterval(poller); poller = null; return; }
 
   let finished = false;
   await Promise.all(cards.map(async (el) => {
     const s = await api(`/api/videos/${el.dataset.id}/status`).catch(() => null);
     if (!s) return;
-    if (s.status !== el.dataset.status && (s.status === 'ready' || s.status === 'failed')) {
+    if (s.status !== el.dataset.status
+        && ['ready', 'failed', 'downloaded'].includes(s.status)) {
       finished = true;
       return;
     }
@@ -1353,6 +1629,8 @@ async function pollProgress() {
 
 /* ---------------------------------------------------------------- wire --- */
 document.getElementById('btn-upload').onclick = openUpload;
+document.getElementById('btn-link').onclick = openDownload;
+window.__download = openDownload;
 document.getElementById('btn-settings').onclick = openSettings;
 window.__upload = openUpload;
 window.__close = closeModal;

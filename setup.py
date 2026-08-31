@@ -22,6 +22,13 @@ URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
 
 WANTED = {f"ffmpeg{EXE}", f"ffprobe{EXE}"}
 
+# yt-dlp ships as a single self-contained executable, so fetching it is one
+# request and no unpacking. It is optional - the app only needs it to download
+# a video from a link - so a failure here is a warning, not a dead install.
+YTDLP_URL = {
+    "nt": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+}.get(os.name, "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp")
+
 
 def _mb(n: int) -> str:
     return f"{n / 1048576:.1f} MB"
@@ -82,6 +89,27 @@ def download_ffmpeg() -> None:
         sys.exit(1)
 
 
+def download_ytdlp() -> bool:
+    """Fetch yt-dlp into ./bin. Optional: only the URL downloader needs it."""
+    dst = BIN / f"yt-dlp{EXE}"
+    if dst.exists() or shutil.which("yt-dlp"):
+        return True
+    BIN.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading yt-dlp -> {BIN}")
+    try:
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        urllib.request.urlretrieve(YTDLP_URL, tmp)
+        tmp.replace(dst)
+        dst.chmod(0o755)
+        print(f"  yt-dlp  ({_mb(dst.stat().st_size)})")
+        return True
+    except Exception as e:
+        print(f"  Could not fetch yt-dlp: {e}")
+        print("  Downloading videos from a link will be unavailable until you")
+        print(f"  put yt-dlp{EXE} in {BIN} yourself.")
+        return False
+
+
 def check_python_deps() -> list[str]:
     missing = []
     for mod, pkg in [("fastapi", "fastapi"), ("uvicorn", "uvicorn[standard]"),
@@ -127,6 +155,9 @@ def main() -> None:
         except Exception as e:
             print(f"  FAIL {name}: {e}")
             sys.exit(1)
+
+    print()
+    download_ytdlp()
 
     for d in ["data/library", "data/tmp"]:
         (ROOT / d).mkdir(parents=True, exist_ok=True)

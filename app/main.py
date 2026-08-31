@@ -13,8 +13,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, Respons
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
-from . import (hlsout, library, llm, media, pipeline, subtitles, translate, tts,
-               voiceclone)
+from . import (download, hlsout, library, llm, media, pipeline, subtitles,
+               translate, tts, voiceclone)
 from .config import (LIBRARY, ROOT, key_locations, load_settings,
                      save_settings)
 
@@ -32,12 +32,34 @@ VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpg", ".mpeg",
 @app.on_event("startup")
 def _startup() -> None:
     library.init()
-    # anything left mid-flight by a previous run is not actually running
-    for v in library.all_videos():
-        if v["status"] == "processing":
+    # Anything left mid-flight by the previous run is not actually running, but
+    # it is not lost either: every expensive stage is checkpointed, so putting
+    # it back on the queue costs only the work that was in flight when the
+    # server stopped. It used to be marked failed and left for the viewer to
+    # notice and retry by hand, which on a closed laptop meant an hour of
+    # finished translation sitting there waiting to be asked for.
+    resumed = 0
+    for v in sorted(library.all_videos(), key=lambda x: x.get("created_at") or 0):
+        # A download interrupted by the restart has no worker behind it any
+        # more. It cannot be resumed from here - yt-dlp owns that, and the
+        # partial file may be anything - but leaving the row saying
+        # "downloading" gives the card a progress bar that never moves again
+        # and no way to retry, because retry refuses a video already in flight.
+        if v["status"] == "downloading":
             library.update(v["id"], status="failed",
                            error="Interrupted - the server restarted.",
-                           stage="Interrupted")
+                           stage="Download interrupted - start it again")
+            continue
+        if v["status"] in ("processing", "queued"):
+            opts = dict(load_settings())
+            opts["source_language"] = v.get("source_lang") or opts["source_language"]
+            opts["voice"] = v.get("voice") or opts["voice"]
+            library.update(v["id"], status="queued", error=None,
+                           stage="Queued - picking up where it stopped")
+            POOL.submit(pipeline.process, v["id"], opts)
+            resumed += 1
+    if resumed:
+        print(f"  resuming {resumed} unfinished video(s)")
 
 
 # ------------------------------------------------------------------- pages ---
@@ -165,6 +187,23 @@ def api_video(vid: str):
     return v
 
 
+@app.post("/api/videos/{vid}/position")
+def api_position(vid: str, body: dict):
+    """Remember where the viewer stopped, so an hour-long episode resumes.
+
+    Written from the player every few seconds, so it stays deliberately cheap:
+    one column, no segment reload, and nothing to do with the pipeline.
+    """
+    if not library.get(vid):
+        raise HTTPException(404, "Video not found")
+    try:
+        at = max(0.0, float(body.get("at") or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "position must be a number")
+    library.set_position(vid, at)
+    return {"ok": True}
+
+
 @app.get("/api/videos/{vid}/status")
 def api_status(vid: str):
     v = library.get(vid)
@@ -250,6 +289,91 @@ async def api_upload(
     library.update(vid, stage="Queued", status="queued")
     POOL.submit(pipeline.process, vid, opts)
     return {"id": vid}
+
+
+# ---------------------------------------------------------------- download ---
+# Its own worker. Downloading is network-bound and dubbing is CPU and API bound,
+# so sharing the single dubbing thread would mean a long download blocking a
+# queue of videos that are ready to be worked on.
+DL_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="get")
+
+
+@app.get("/api/download/available")
+def api_download_available():
+    return {"ok": download.available()}
+
+
+@app.post("/api/download/probe")
+def api_download_probe(body: dict):
+    """List what qualities a link offers, without downloading anything."""
+    url = (body.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Paste a full http:// or https:// link")
+    try:
+        return download.probe(url)
+    except download.NotInstalled as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"Could not read that link: {e}")
+
+
+def _download_job(vid: str, url: str, fmt: str) -> None:
+    """Fetch the video, then stop. Translating it is a separate decision."""
+    try:
+        # pipeline owns the progress reporter; calling a bare _reporter here
+        # raised NameError before the try block, and a thread pool keeps that
+        # inside the Future nobody reads - the download simply never happened
+        # and the card sat on "Waiting to start" forever.
+        progress = pipeline._reporter(vid)
+        library.update(vid, status="downloading", error=None)
+        path = download.fetch(url, fmt, library.vdir(vid), progress)
+        info = media.media_info(path)
+        library.update(vid, duration=info.get("duration") or 0)
+        thumb = library.vdir(vid) / "thumb.jpg"
+        if not thumb.exists() and info.get("duration"):
+            try:
+                media.thumbnail(path, thumb, at=min(5.0, info["duration"] * 0.15))
+            except Exception:
+                pass
+        library.update(vid, status="downloaded", progress=100,
+                       stage=f"Downloaded - {path.suffix.lstrip('.')} "
+                             f"{path.stat().st_size / 1048576:.0f} MB")
+    except Exception as exc:
+        library.update(vid, status="failed", error=str(exc),
+                       stage="Download failed: " + str(exc)[:160])
+
+
+@app.post("/api/download")
+def api_download(body: dict):
+    url = (body.get("url") or "").strip()
+    fmt = (body.get("format") or "").strip()
+    if not url or not fmt:
+        raise HTTPException(400, "A link and a quality are both required")
+    if not download.available():
+        raise HTTPException(503, "yt-dlp is not installed - run  python setup.py")
+    title = (body.get("title") or "").strip() or "Downloaded video"
+    vid = library.create(title[:200], url, status="downloading",
+                         stage="Starting download", progress=0)
+    DL_POOL.submit(_download_job, vid, url, fmt)
+    return {"id": vid}
+
+
+@app.post("/api/videos/{vid}/translate")
+def api_translate(vid: str):
+    """Send a downloaded video into the dubbing queue - the explicit step."""
+    v = library.get(vid)
+    if not v:
+        raise HTTPException(404, "Video not found")
+    if v["status"] in ("queued", "processing"):
+        raise HTTPException(409, "Already in the queue.")
+    if library.source_file(vid) is None:
+        raise HTTPException(400, "The downloaded file is missing.")
+    opts = dict(load_settings())
+    opts["source_language"] = v.get("source_lang") or opts["source_language"]
+    opts["voice"] = v.get("voice") or opts["voice"]
+    library.update(vid, status="queued", stage="Queued", progress=0, error=None)
+    POOL.submit(pipeline.process, vid, opts)
+    return {"ok": True}
 
 
 @app.post("/api/videos/{vid}/retry")

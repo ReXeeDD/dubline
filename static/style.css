@@ -176,6 +176,75 @@ video { width: 100%; display: block; aspect-ratio: 16/9; background: #000; }
 }
 .pill-group button.on { background: var(--text); color: var(--bg); }
 
+/* ------------------------------------------------------------- tabs --- */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+.tabs a {
+  padding: 12px 16px; font-weight: 600; color: var(--text-2);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tabs a:hover { color: var(--text); }
+.tabs a.on { color: var(--text); border-bottom-color: var(--text); }
+.tabs .pill {
+  display: inline-block; margin-left: 7px; padding: 1px 7px;
+  border-radius: 999px; background: var(--accent); color: var(--accent-ink);
+  font-size: 11px; font-weight: 700;
+}
+
+/* The button that turns a download into a dub - the one deliberate step. */
+.card-act { padding: 0 12px 12px; }
+.card-act .btn { width: 100%; justify-content: center; }
+
+/* ----------------------------------------------------- link download --- */
+.found {
+  display: flex; flex-direction: column; gap: 3px;
+  background: var(--bg-2); border-radius: var(--radius);
+  padding: 12px 14px; margin: 16px 0 12px;
+}
+.found span { color: var(--text-2); font-size: 12px; }
+
+.quals { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.qual {
+  display: grid; grid-template-columns: 20px 62px 1fr auto; align-items: center;
+  gap: 10px; padding: 9px 12px; border: 1px solid var(--line);
+  border-radius: 10px; cursor: pointer;
+}
+.qual:hover { background: var(--bg-3); }
+.qual:has(input:checked) { border-color: var(--accent); background: var(--bg-3); }
+.qual b { font-size: 15px; }
+.qual span { color: var(--text-2); font-size: 12px; }
+.qual em { font-style: normal; font-weight: 600; font-variant-numeric: tabular-nums; }
+/* The exact yt-dlp selector, so it is obvious what is being asked for. */
+.qual code {
+  grid-column: 3 / 5; font-size: 11px; color: var(--text-3);
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+/* ------------------------------------------------- transcript marks --- */
+.mark {
+  display: inline-block; margin-left: 6px; padding: 1px 6px;
+  border-radius: 4px; font-size: 11px; font-weight: 600; vertical-align: middle;
+}
+.mark.fixed { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent); }
+.mark.cut { background: color-mix(in srgb, var(--amber) 24%, transparent); color: var(--amber); }
+.line.flagged { border-left: 2px solid var(--amber); }
+.note {
+  background: var(--bg-2); border-left: 3px solid var(--amber);
+  border-radius: 8px; padding: 10px 14px; margin: 0 0 16px;
+  color: var(--text-2); font-size: 13px;
+}
+
+/* ------------------------------------------------ continue watching --- */
+.watched {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 4px;
+  background: rgba(255, 255, 255, .28);
+}
+.watched > i { display: block; height: 100%; background: var(--red); }
+.seen {
+  position: absolute; right: 8px; bottom: 8px;
+  padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+  background: rgba(0, 0, 0, .75); color: #fff;
+}
+
 /* ------------------------------------------------------- playback speed --- */
 .speed {
   display: inline-flex; align-items: center; gap: 9px; flex-shrink: 0;

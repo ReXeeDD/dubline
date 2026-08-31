@@ -195,7 +195,10 @@ def transcribe(client, audio: Path, model: str, language: str,
 
     segments = _repair(client, audio, model, detected, segments, parts, progress)
     segments.sort(key=lambda s: s["start"])
-    segments = _merge(_clean(segments, duration))
+    # Split before merging, not after: _merge is what re-joins the pieces that
+    # still belong together, so a split made first costs nothing where the
+    # timing already worked.
+    segments = _merge(_split_long(_clean(segments, duration)))
     for i, s in enumerate(segments):
         s["id"] = i
     return segments, detected
@@ -297,6 +300,71 @@ MERGE_MAX_GAP = 0.40     # only join across pauses shorter than this
 MERGE_MAX_CHARS = 44     # keep subtitles readable in two lines
 _CJK = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
 _SENT_END = re.compile(r"[。！？!?…]\s*$")
+
+
+# Splitting a run-on segment reads better at a pause in the sentence, so these
+# are tried in order of how strongly each one ends a thought.
+_BREAKS = ("。！？!?…", "，,、；;：:", " ")
+
+
+def _split_long(segs: list[dict]) -> list[dict]:
+    """Break segments that are longer than a subtitle should ever be.
+
+    _merge caps what it JOINS, but nothing caps what Whisper hands over in the
+    first place, and on a long unbroken passage it returns one enormous
+    segment - measured across the library, 82 lines over the 7 second cap and a
+    worst case of 30 seconds carrying 294 characters of English.
+
+    Every stage downstream then works from that: the translator is told it has
+    450 characters to fill and writes a paragraph, edge-tts speaks it as one
+    breathless run, and the subtitle is unreadable. Splitting here fixes all
+    three at once, because everything after this point measures a line by its
+    own start and end.
+
+    The source carries no punctuation for most of this material, so the split
+    falls back to an even division of the characters, with the time shared out
+    in proportion. That is an estimate - but a 6 second line whose text is
+    approximately placed is worth far more than a 12 second line that is
+    exactly wrong.
+    """
+    out: list[dict] = []
+    for s in segs:
+        span = s["end"] - s["start"]
+        text = s["text"]
+        parts = int(span // MERGE_MAX_SPAN) + 1
+        if parts < 2 or len(text) < 8:
+            out.append(s)
+            continue
+
+        cuts, step = [], len(text) / parts
+        for k in range(1, parts):
+            want = int(k * step)
+            # Look for a real pause within a fifth of the text either side of
+            # the even split, strongest punctuation first, before giving up and
+            # cutting where the arithmetic said.
+            reach = max(2, len(text) // (parts * 5))
+            best = want
+            for chars in _BREAKS:
+                found = [j for j in range(max(1, want - reach),
+                                          min(len(text) - 1, want + reach))
+                         if text[j] in chars]
+                if found:
+                    best = min(found, key=lambda j: abs(j - want)) + 1
+                    break
+            cuts.append(best)
+
+        bounds = [0] + sorted(set(c for c in cuts if 0 < c < len(text))) + [len(text)]
+        for a, b in zip(bounds, bounds[1:]):
+            piece = text[a:b].strip()
+            if not piece:
+                continue
+            # Time follows the characters: a piece carrying a third of the text
+            # gets a third of the span.
+            lo = s["start"] + span * (a / len(text))
+            hi = s["start"] + span * (b / len(text))
+            out.append({**s, "start": round(lo, 2), "end": round(hi, 2),
+                        "text": piece})
+    return out
 
 
 def _merge(segs: list[dict]) -> list[dict]:

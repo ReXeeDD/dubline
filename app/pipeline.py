@@ -107,6 +107,7 @@ def process(vid: str, opts: dict) -> None:
     work = folder / "work"
     work.mkdir(exist_ok=True)
     progress = _reporter(vid)
+    segments: list[dict] = []
 
     try:
         library.update(vid, status="processing", error=None)
@@ -172,6 +173,18 @@ def process(vid: str, opts: dict) -> None:
                 dub=dub, stats=stats)
 
     except Exception as exc:
+        # Whatever was translated before the failure has already been paid for,
+        # and `segments` is mutated in place as it arrives. The streaming
+        # pipeline only saves at a window boundary, so a run that dies inside a
+        # window - which is exactly what running out of daily tokens does -
+        # threw away up to five minutes of finished translation and bought it
+        # again on the retry. `en` is the resume signal, so saving here is all
+        # it takes to keep it.
+        try:
+            if any(s.get("en", "").strip() for s in segments):
+                library.save_segments(vid, segments)
+        except Exception:
+            pass        # never let bookkeeping replace the real error
         library.update(vid, status="failed", error=f"{exc}",
                        stage="Failed: " + str(exc)[:180])
         (work / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
@@ -384,10 +397,12 @@ def _stream_dub(vid: str, src: Path, segments: list[dict], duration: float,
                     # Read back what came out and re-ask for the lines that are
                     # plainly wrong, while this window is still ahead of the
                     # speech stage and nothing has been spoken yet.
-                    translate.polish(
+                    got = translate.polish(
                         clients, segments,
                         [llm.translation_model(opts)] + helpers, lang,
                         glossary, early, budgets=budgets, window=(lo, hi))
+                    mixer.stats["fixed"] = (mixer.stats.get("fixed", 0)
+                                            + got.get("fixed", 0))
                 ready.put((lo, hi, until))
         except BaseException as exc:       # hand it to the consumer to raise
             failure.append(exc)

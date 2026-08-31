@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -110,8 +111,39 @@ def list_voices() -> list[dict]:
 
 
 # --------------------------------------------------------------- synthesis ---
+# Characters that reach the voice looking like text but are not spoken as text.
+# The non-breaking hyphen is what LLMs reach for in "god-tier" and "max-level";
+# it is not the ASCII hyphen and an English voice has no rule for it. The rest
+# are quotation and dash forms that only exist to be read on a page.
+_TYPOGRAPHY = {
+    "‑": "-", "‒": "-", "–": "-", "—": " - ",
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "…": " ", "­": "",
+}
+# Vietnamese vowels carry marks that an English voice cannot read: "Loan Phuong"
+# is a name it can say, "Loan Phượng" is one it stumbles over. Measured across
+# the library, 159 lines - 3% of the Vietnamese ones - carry a name like this.
+# Only the SPOKEN text is folded down; the subtitle keeps the correct spelling,
+# which is what the viewer reads.
+_VN_LETTERS = str.maketrans({"đ": "d", "Đ": "D", "ơ": "o", "Ơ": "O",
+                             "ư": "u", "Ư": "U", "ă": "a", "Ă": "A"})
+
+
 def _clean_for_speech(text: str) -> str:
+    """The line as the voice should receive it, not as the viewer reads it."""
     text = re.sub("[一-鿿　-〿＀-￯]+", " ", text)  # stray CJK
+    for bad, good in _TYPOGRAPHY.items():
+        text = text.replace(bad, good)
+    # Nothing is said by a line that opens mid-thought, and the voice reads the
+    # dots as a long unexplained pause at the very moment it should be talking.
+    text = re.sub(r"^\s*(?:\.\.\.|…)\s*", "", text)
+    text = text.translate(_VN_LETTERS)
+    # Strip the tone marks that are left, keeping the base letter. Latin only -
+    # a decomposed CJK character must not lose anything here.
+    text = "".join(c for c in unicodedata.normalize("NFD", text)
+                   if not (unicodedata.combining(c) and c.isascii() is False
+                           and ord(c) < 0x0370))
+    text = unicodedata.normalize("NFC", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -492,6 +524,12 @@ def _plan(segments: list[dict], results: dict, total_duration: float,
         if not r or not r.get("file"):
             continue
         nxt = segments[i + 1]["start"] if i + 1 < len(segments) else total_duration
+        # Cleared before they can be set again below. These are saved into
+        # segments.json and the transcript draws a "cut short" badge from them,
+        # so a line that was rushed once and has since been shortened by hand
+        # would otherwise keep the badge for the life of the video.
+        seg.pop("crowded", None)
+        seg.pop("clipped", None)
 
         want = breath_after(seg.get("en", "")) if i + 1 < len(segments) else MIN_GAP
         room = nxt - seg["start"]
@@ -514,8 +552,13 @@ def _plan(segments: list[dict], results: dict, total_duration: float,
                              RESCUE_TOTAL_RATE / r.get("native_rate", 1.0))
                 tempo = min(max(tempo, r["duration"] / limit), max(tempo, rescue))
                 stats["crowded"] += 1
+                # Recorded on the line itself, not only in the totals, so the
+                # transcript can point at the handful of lines that had to be
+                # rushed or cut and they can be shortened by hand.
+                seg["crowded"] = True
                 if r["duration"] / tempo > limit + 0.01:
                     stats["clipped"] += 1
+                    seg["clipped"] = True
         else:
             limit = float("inf")
 
