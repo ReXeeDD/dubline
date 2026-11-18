@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
+import threading
 import webbrowser
 from pathlib import Path
 
@@ -33,25 +35,39 @@ def main() -> None:
     from app.config import BIN, LIBRARY, ffmpeg_ready
 
     if not ffmpeg_ready():
-        sys.exit(f"ffmpeg was not found in {BIN}.\nRun:  python setup.py")
+        sys.exit(f"Working ffmpeg and ffprobe are required in {BIN} or on PATH.\n"
+                 "Run:  python setup.py")
 
-    url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{args.port}"
-    print()
-    print("  Dubline is running")
-    print(f"    {url}")
-    if args.lan:
-        print("    (also reachable from other devices on your network)")
-    print(f"    library: {LIBRARY}")
-    print("    press Ctrl+C to stop")
-    print()
+    class DublineServer(uvicorn.Server):
+        async def startup(self, sockets=None):
+            await super().startup(sockets=sockets)
+            if self.started:
+                print(f"  Dubline is running at {url}", flush=True)
+                if args.lan:
+                    print("    (also reachable from other devices on your network)")
+                print(f"    library: {LIBRARY}\n    press Ctrl+C to stop", flush=True)
+                if args.open:
+                    threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
-    if args.open:
-        import threading
-
-        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-
-    uvicorn.run("app.main:app", host=host, port=args.port,
-                log_level="warning", access_log=False)
+    # Reserve the port before application startup resumes any queued jobs.
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as listener:
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((host, args.port))
+        except (OSError, OverflowError) as exc:
+            sys.exit(f"Could not listen on {host} port {args.port}: {exc}")
+        address = "localhost" if host in ("127.0.0.1", "0.0.0.0", "::") else host
+        if ":" in address:
+            address = f"[{address}]"
+        url = f"http://{address}:{listener.getsockname()[1]}"
+        server = DublineServer(uvicorn.Config("app.main:app", host=host, port=args.port,
+                                               log_level="warning", access_log=False))
+        server.run(sockets=[listener])
+        if not server.started:
+            sys.exit("Dubline failed to start.")
 
 
 if __name__ == "__main__":

@@ -1,20 +1,17 @@
-"""One-time setup: fetch ffmpeg into ./bin and verify the install.
-
-Everything lands inside this project folder on D: - nothing touches C:.
-"""
+"""Verify the install and fetch missing executables into ./bin on Windows."""
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
-import subprocess
 import sys
+import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-BIN = ROOT / "bin"
-TMP = ROOT / "data" / "tmp"
+from app.config import BIN, INSTALL_DIR, TMP, ffmpeg, ffmpeg_executable_works, ffmpeg_ready, ffprobe
+
 EXE = ".exe" if os.name == "nt" else ""
 
 URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
@@ -34,59 +31,54 @@ def _mb(n: int) -> str:
     return f"{n / 1048576:.1f} MB"
 
 
-def have(name: str) -> str | None:
-    p = BIN / f"{name}{EXE}"
-    if p.exists():
-        return str(p)
-    return shutil.which(name)
+def _download(url: str, destination: Path) -> None:
+    with urllib.request.urlopen(url, timeout=30) as response, destination.open("wb") as out:
+        shutil.copyfileobj(response, out)
 
 
 def download_ffmpeg() -> None:
-    BIN.mkdir(parents=True, exist_ok=True)
-    TMP.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading ffmpeg and ffprobe -> {BIN}", flush=True)
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-", dir=TMP) as work:
+        stage = Path(work)
+        archive = stage / "ffmpeg.zip"
+        _download(URL, archive)
 
-    print(f"Downloading ffmpeg -> {BIN}")
-    print(f"  source: {URL}")
+        print("  Extracting and verifying ffmpeg and ffprobe...", flush=True)
+        with zipfile.ZipFile(archive) as z:
+            members = {Path(member.filename).name: member for member in z.infolist()
+                       if not member.is_dir()}
+            for name in sorted(WANTED):
+                if name not in members:
+                    raise RuntimeError(f"The archive is missing {name}.")
+                candidate = stage / name
+                with z.open(members[name]) as src, candidate.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                if not ffmpeg_executable_works(candidate):
+                    raise RuntimeError(f"The downloaded {name} failed its version check.")
 
-    zip_path = TMP / "ffmpeg.zip"
-    last = [0]
+        for name in sorted(WANTED):
+            (stage / name).replace(BIN / name)
 
-    def hook(blocks: int, bsize: int, total: int) -> None:
-        got = blocks * bsize
-        pct = int(got * 100 / total) if total > 0 else 0
-        if pct >= last[0] + 5 or got >= total:
-            last[0] = pct
-            bar = "#" * (pct // 3)
-            sys.stdout.write(f"\r  [{bar:<33}] {pct:3d}%  {_mb(got)}")
-            sys.stdout.flush()
+
+def ensure_ffmpeg() -> bool:
+    if ffmpeg_ready():
+        return True
+    if os.name != "nt":
+        print("Install ffmpeg and ffprobe with your system package manager and put "
+              "them on PATH.", file=sys.stderr)
+        return False
 
     try:
-        urllib.request.urlretrieve(URL, zip_path, reporthook=hook)
-    except Exception as e:
-        print(f"\n  Download failed: {e}")
-        print("\n  Alternatives:")
-        print("   1. winget install Gyan.FFmpeg   (installs system-wide)")
-        print(f"   2. Download {URL}")
-        print(f"      and copy ffmpeg{EXE} + ffprobe{EXE} into {BIN}")
-        sys.exit(1)
-
-    print("\n  Extracting...")
-    extracted = 0
-    with zipfile.ZipFile(zip_path) as z:
-        for member in z.infolist():
-            name = Path(member.filename).name
-            if name in WANTED:
-                with z.open(member) as srcf, (BIN / name).open("wb") as dstf:
-                    shutil.copyfileobj(srcf, dstf)
-                (BIN / name).chmod(0o755)
-                extracted += 1
-                print(f"    {name}  ({_mb(member.file_size)})")
-
-    zip_path.unlink(missing_ok=True)
-
-    if extracted < 2:
-        print(f"  Expected 2 binaries, extracted {extracted}.")
-        sys.exit(1)
+        download_ffmpeg()
+        if not ffmpeg_ready():
+            raise RuntimeError("The installed ffmpeg and ffprobe could not be verified.")
+    except (OSError, RuntimeError, zipfile.BadZipFile) as e:
+        print(f"  Could not install ffmpeg and ffprobe: {e}", file=sys.stderr)
+        print(f"  Download {URL}\n"
+              f"  and copy ffmpeg.exe and ffprobe.exe from its bin folder into {BIN}.",
+              file=sys.stderr)
+        return False
+    return True
 
 
 def download_ytdlp() -> bool:
@@ -94,13 +86,13 @@ def download_ytdlp() -> bool:
     dst = BIN / f"yt-dlp{EXE}"
     if dst.exists() or shutil.which("yt-dlp"):
         return True
-    BIN.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading yt-dlp -> {BIN}")
+    print(f"Downloading yt-dlp -> {BIN}", flush=True)
     try:
-        tmp = dst.with_suffix(dst.suffix + ".part")
-        urllib.request.urlretrieve(YTDLP_URL, tmp)
-        tmp.replace(dst)
-        dst.chmod(0o755)
+        with tempfile.TemporaryDirectory(prefix="yt-dlp-", dir=TMP) as work:
+            tmp = Path(work) / dst.name
+            _download(YTDLP_URL, tmp)
+            tmp.chmod(0o755)
+            tmp.replace(dst)
         print(f"  yt-dlp  ({_mb(dst.stat().st_size)})")
         return True
     except Exception as e:
@@ -123,11 +115,17 @@ def check_python_deps() -> list[str]:
     return missing
 
 
-def main() -> None:
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Set up Dubline")
+    parser.add_argument("--ffmpeg-only", action="store_true",
+                        help="verify or install ffmpeg and ffprobe for startup")
+    if parser.parse_args().ffmpeg_only:
+        return 0 if ensure_ffmpeg() else 1
+
     print("=" * 58)
     print("  Dubline setup")
     print("=" * 58)
-    print(f"  Project : {ROOT}")
+    print(f"  Project : {INSTALL_DIR}")
     print(f"  Binaries: {BIN}")
     print()
 
@@ -138,29 +136,13 @@ def main() -> None:
         print("    pip install " + " ".join(missing))
         print()
 
-    ff, fp = have("ffmpeg"), have("ffprobe")
-    if ff and fp:
-        print(f"  ffmpeg  found: {ff}")
-        print(f"  ffprobe found: {fp}")
-    else:
-        download_ffmpeg()
-        ff, fp = have("ffmpeg"), have("ffprobe")
-
-    print()
-    for name, path in (("ffmpeg", ff), ("ffprobe", fp)):
-        try:
-            out = subprocess.run([path, "-version"], capture_output=True, timeout=25)
-            line = out.stdout.decode("utf-8", "ignore").splitlines()[0]
-            print(f"  OK  {line[:70]}")
-        except Exception as e:
-            print(f"  FAIL {name}: {e}")
-            sys.exit(1)
+    if not ensure_ffmpeg():
+        return 1
+    print(f"  ffmpeg  verified: {ffmpeg()}")
+    print(f"  ffprobe verified: {ffprobe()}")
 
     print()
     download_ytdlp()
-
-    for d in ["data/library", "data/tmp"]:
-        (ROOT / d).mkdir(parents=True, exist_ok=True)
 
     print()
     if missing:
@@ -169,7 +151,8 @@ def main() -> None:
         print("  Setup complete. Start the app with:")
     print("    python run.py")
     print()
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

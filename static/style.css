@@ -349,6 +349,19 @@ video { width: 100%; display: block; aspect-ratio: 16/9; background: #000; }
   background: var(--bg-3); border: 1px solid var(--line); outline: none;
 }
 .field input:focus, .field select:focus { border-color: var(--accent); }
+.groq-keys .groq-key-field { margin-bottom: 12px; }
+.groq-key-controls {
+  display: grid; grid-template-columns: minmax(0, 1fr) 4rem 5.5rem 2.25rem; gap: 8px;
+}
+.groq-key-controls input { min-width: 0; }
+.groq-key-controls input::placeholder { color: var(--text-2); opacity: 1; }
+.groq-key-controls .btn { justify-content: center; padding-inline: 0; white-space: nowrap; }
+.groq-key-result.alert { margin: 6px 0 0; }
+.groq-keys .hint a { color: var(--accent); }
+@media (max-width: 460px) {
+  .groq-key-controls { grid-template-columns: 4rem 5.5rem 2.25rem; }
+  .groq-key-controls input { grid-column: 1 / -1; }
+}
 .row { display: flex; gap: 12px; }
 .row > * { flex: 1; }
 

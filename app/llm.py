@@ -10,7 +10,7 @@ import json
 import urllib.error
 import urllib.request
 
-from groq import Groq
+from groq import AuthenticationError, Groq
 
 DEFAULT_LOCAL_URL = "http://localhost:1234/v1"   # LM Studio's default
 
@@ -161,15 +161,13 @@ def verify_key(api_key: str) -> dict:
     if not api_key:
         return {"ok": False, "detail": "No key entered."}
     try:
-        Groq(api_key=api_key).models.list()
-    except Exception as e:
-        msg = str(e)
-        if "401" in msg or "invalid_api_key" in msg:
-            return {"ok": False, "detail": "Groq rejected this key. "
-                                           "Check it was copied in full."}
-        return {"ok": False, "detail": f"Could not reach Groq: {msg[:200]}"}
+        data = Groq(api_key=api_key, timeout=10, max_retries=0).models.list().data
+    except AuthenticationError:
+        return {"ok": False, "detail": "Groq rejected this key. Check it was copied in full."}
+    except Exception:
+        return {"ok": False, "detail": "Could not verify this key with Groq. Try again."}
 
-    models = list_groq_models(api_key)
+    models = _group_groq_models([m.id for m in data if m.id])
     n = len(models["chat"]) + len(models["asr"])
     return {"ok": True, "detail": f"Key works - {n} usable models available.",
             "chat": models["chat"], "asr": models["asr"]}
@@ -187,7 +185,10 @@ def list_groq_models(api_key: str) -> dict[str, list[str]]:
         ids = [m.id for m in Groq(api_key=api_key).models.list().data if m.id]
     except Exception:
         return {"chat": [], "helpers": [], "asr": []}
+    return _group_groq_models(ids)
 
+
+def _group_groq_models(ids: list[str]) -> dict[str, list[str]]:
     # Everything Groq hosts is in this list, including safety classifiers and
     # speech synthesis. Only conversational models can translate.
     skip = ("prompt-guard", "safeguard", "orpheus", "-tts", "guard-")

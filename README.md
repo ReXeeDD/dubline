@@ -21,13 +21,29 @@ your videos, temp files — stays inside this folder.
 
 ## Quick start
 
-**Windows:** download or clone the repo and double-click **`start.bat`**.
+**Windows:** download or clone the repo and double-click **`Dubline.exe`** or
+**`start.bat`**. Keep the launcher in the project folder with the rest of the
+files. Both launchers require Python 3.10 or newer and accept options such as
+`--port 9000` and `--lan`.
 
-The first run builds a private Python environment in `.venv\`, installs the
-packages, downloads ffmpeg into `bin\`, and opens the app. It takes a few
-minutes. Every run after that starts in a couple of seconds.
+The first run builds a private Python environment in `.venv\` and installs the
+packages. The launcher uses a working `ffmpeg` and `ffprobe` from `bin\` or
+`PATH`. If either tool is unavailable, it downloads both into `bin\` before
+opening the app.
+
+Both launchers check the official GitHub `main` branch at startup. Updates are
+staged under `data/updates/`, and the app continues to use the same library,
+settings, Python environment, and FFmpeg tools. If GitHub or the update setup
+is unavailable, the launcher uses the installed version. Git checkouts with
+local edits, a different branch, or a fork run from their working tree. To
+launch the copy next to the launchers manually, pass `--no-update`.
+
+To rebuild the Windows executable, run `.\tools\build-launcher.ps1` in PowerShell.
 
 **Anything else:**
+
+Install `ffmpeg` and `ffprobe` with your system package manager and make sure
+both are on `PATH`.
 
 ```bash
 pip install -r requirements.txt
@@ -56,7 +72,7 @@ servers, not yours.
 
 | Thing | Size | How you get it |
 |---|---|---|
-| **ffmpeg + ffprobe** | ~180 MB | **Automatic.** `setup.py` downloads them into `bin\`. If it fails, grab [`ffmpeg-master-latest-win64-gpl.zip`](https://github.com/BtbN/FFmpeg-Builds/releases) and copy `ffmpeg.exe` and `ffprobe.exe` out of its `bin\` folder into this project's `bin\`. |
+| **ffmpeg + ffprobe** | ~180 MB | **Automatic on Windows** when either tool is missing. If the download fails, grab [`ffmpeg-master-latest-win64-gpl.zip`](https://github.com/BtbN/FFmpeg-Builds/releases) and copy `ffmpeg.exe` and `ffprobe.exe` out of its `bin\` folder into this project's `bin\`. |
 | **Groq API key** | — | Free at <https://console.groq.com/keys>. Paste it into Settings. This is the only thing you must supply by hand. |
 | **Whisper + the translation LLM** | — | Hosted by Groq. Nothing to download. |
 | **Speech voices** | — | Microsoft Edge TTS. 47 English voices, streamed, no key and no download. |

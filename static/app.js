@@ -536,39 +536,29 @@ async function fillSettings(root) {
   });
   const opt = (list, sel) => list.map((m) =>
     `<option value="${esc(m)}"${m === sel ? ' selected' : ''}>${esc(m)}</option>`).join('');
+  const keyField = (id, label, preview = '', ref = null) => `
+    <div class="field groq-key-field"${ref !== null ? ` data-key-ref="${esc(ref)}"` : ''}>
+      <label for="${id}">${label}</label>
+      <div class="groq-key-controls">
+        <input type="password" id="${id}" placeholder="${esc(preview || 'gsk_...')}"
+               autocomplete="off" spellcheck="false" autocapitalize="none">
+        <button type="button" class="btn ghost groq-key-show" aria-pressed="false">Show</button>
+        <button type="button" class="btn ghost groq-key-test">Test key</button>
+        ${ref !== null ? '<button type="button" class="btn ghost groq-key-remove" aria-label="Remove key" title="Remove key">×</button>' : ''}
+      </div>
+      <div class="groq-key-result" role="status"></div>
+    </div>`;
+  let nextKeyId = 2;
 
   body.innerHTML = `
-      <div class="field">
-        <label for="key">Groq API key</label>
-        <div style="display:flex;gap:8px">
-          <input type="password" id="key" style="flex:1"
-                 placeholder="${cfg.has_key ? esc(cfg.groq_api_key) : 'gsk_...'}">
-          <button class="btn ghost" id="showkey" title="Show or hide">👁</button>
-          <button class="btn ghost" id="testkey">Test key</button>
-        </div>
-        <div id="keyresult"></div>
-        <div class="hint">Used for transcription (Whisper) and translation.
-          Free key at <a href="https://console.groq.com/keys" target="_blank"
-          rel="noopener" style="color:var(--accent)">console.groq.com/keys</a>.</div>
-      </div>
-
-      <div class="field">
-        <label>Extra keys for translation</label>
-        <div class="hint" style="margin:0 0 8px">Rate limits are metered
-          <b>per account</b>, so a second key of your own shares the same budget
-          and changes nothing. A key from a <b>different account</b> brings its
-          own, and translation is split across all of them.</div>
-        <div id="extrakeys">${
-          (cfg.groq_api_keys || []).map((k, i) => `
-            <div class="extrakey" style="display:flex;gap:8px;margin-bottom:7px">
-              <input type="password" class="xkey" style="flex:1"
-                     value="${esc(k)}" placeholder="gsk_...">
-              <button class="btn ghost xtest" data-i="${i}">Test</button>
-              <button class="btn ghost xdel" title="Remove">&#10005;</button>
-            </div>`).join('')
-        }</div>
-        <button class="btn ghost" id="addkey" style="padding:6px 13px">+ Add a key</button>
-        <div class="hint" id="keycount"></div>
+      <div class="field groq-keys">
+        ${keyField('key', 'Groq API key', cfg.groq_api_key)}
+        <div id="extrakeys">${(cfg.groq_extra_keys || []).map(({ref, preview}) =>
+          keyField(`groq-key-${nextKeyId++}`, 'Extra Groq API key', preview, ref)).join('')}</div>
+        <button type="button" class="btn ghost" id="addkey">+ Add a key</button>
+        <div class="hint">The first key is used for transcription and translation.
+          Extra keys are used for translation. Groq rate limits apply per organization.
+          <a href="https://console.groq.com/keys" target="_blank" rel="noopener">Get a Groq API key</a>.</div>
         <div class="paths">
           <div><b>Saved to</b></div>
           <div>${store.settings_saved ? '&#10003;' : '&#183;'}
@@ -576,8 +566,7 @@ async function fillSettings(root) {
           <div>${store.cache_saved ? '&#10003;' : '&#183;'}
                <code>${esc(store.cache_file || '')}</code> <span>cached backup</span></div>
           ${store.from_env ? `<div>&#10003; <span>GROQ_API_KEY environment variable</span></div>` : ''}
-          <div class="note">The cached copy restores your key automatically if
-            settings.json is deleted. Both files stay on D: in this project folder.</div>
+          <div class="note">The backup restores the primary key if settings.json is deleted.</div>
         </div>
       </div>
 
@@ -713,98 +702,92 @@ async function fillSettings(root) {
   root.querySelector('#llmm')?.addEventListener('change', tput);
   tput();
 
-  /* ---- extra keys ------------------------------------------------------ */
+  /* ---- Groq keys ------------------------------------------------------- */
   const extraBox = root.querySelector('#extrakeys');
-  const extraKeys = () => [...root.querySelectorAll('.xkey')]
-    .map((i) => i.value.trim()).filter(Boolean);
-
-  const countKeys = () => {
-    const n = extraKeys().length + 1;
-    const note = root.querySelector('#keycount');
-    if (!note) return;
-    note.innerHTML = n === 1
-      ? 'One key. Translation runs on its buckets alone.'
-      : `<b style="color:var(--accent)">${n} keys</b> - translation is spread `
-        + `across all of them. Only worth it if they are different accounts.`;
-  };
-
-  const wireRow = (row) => {
-    row.querySelector('.xdel').onclick = (e) => {
-      e.preventDefault(); row.remove(); countKeys();
-    };
-    row.querySelector('.xtest').onclick = async (e) => {
-      e.preventDefault();
-      const btn = e.target;
-      const val = row.querySelector('.xkey').value.trim();
-      if (!val) { toast('Paste a key first.', true); return; }
-      const label = btn.textContent;
-      btn.disabled = true; btn.textContent = '...';
-      try {
-        const r = await jsonPost('/api/settings/test-key', { key: val });
-        toast(r.ok ? r.detail : r.detail, !r.ok);
-      } catch (err) { toast(err.message, true); }
-      btn.disabled = false; btn.textContent = label;
-    };
-  };
-  extraBox.querySelectorAll('.extrakey').forEach(wireRow);
-
-  root.querySelector('#addkey').onclick = (e) => {
-    e.preventDefault();
-    const row = document.createElement('div');
-    row.className = 'extrakey';
-    row.style.cssText = 'display:flex;gap:8px;margin-bottom:7px';
-    row.innerHTML = `<input type="password" class="xkey" style="flex:1" placeholder="gsk_...">
-      <button class="btn ghost xtest">Test</button>
-      <button class="btn ghost xdel" title="Remove">&#10005;</button>`;
-    extraBox.append(row);
-    wireRow(row);
-    row.querySelector('.xkey').oninput = countKeys;
-    row.querySelector('.xkey').focus();
-    countKeys();
-  };
-  extraBox.querySelectorAll('.xkey').forEach((i) => { i.oninput = countKeys; });
-  countKeys();
-
   const keyInput = root.querySelector('#key');
-  const keyResult = root.querySelector('#keyresult');
+  let pendingKeyTests = 0;
+  let savingSettings = false;
+  let extraKeysEdited = false;
+  const extraKeys = () => [...extraBox.children].flatMap((row) => {
+    const key = row.querySelector('input').value.trim();
+    if (key) return [{key}];
+    return row.dataset.keyRef ? [{ref: row.dataset.keyRef}] : [];
+  });
+
+  const wireKey = (row) => {
+    const input = row.querySelector('input');
+    const show = row.querySelector('.groq-key-show');
+    const test = row.querySelector('.groq-key-test');
+    const remove = row.querySelector('.groq-key-remove');
+    const status = row.querySelector('.groq-key-result');
+    const extra = Boolean(remove);
+    const feedback = (message, ok) => {
+      status.className = `groq-key-result alert${ok ? ' info' : ''}`;
+      status.textContent = message;
+    };
+    if (extra) remove.onclick = () => {
+      extraKeysEdited = true;
+      row.remove();
+    };
+    input.oninput = () => {
+      status.className = 'groq-key-result';
+      status.textContent = '';
+      if (extra) extraKeysEdited = true;
+    };
+    const reveal = (visible) => {
+      input.type = visible ? 'text' : 'password';
+      show.textContent = visible ? 'Hide' : 'Show';
+      show.setAttribute('aria-pressed', String(visible));
+    };
+    show.onclick = () => reveal(input.type === 'password');
+    test.onclick = async () => {
+      if (savingSettings) return;
+      const key = input.value.trim();
+      pendingKeyTests++;
+      saveBtn.disabled = true;
+      input.disabled = test.disabled = true;
+      if (remove) remove.disabled = true;
+      test.textContent = 'Testing…';
+      try {
+        const r = await jsonPost('/api/settings/test-key', extra
+          ? {key, extra: true, extra_key_ref: row.dataset.keyRef, save: true}
+          : {groq_api_key: key, save: true});
+        feedback(r.ok && key ? 'Key verified and saved.' : r.detail, r.ok);
+        if (!r.ok) return;
+        input.value = '';
+        reveal(false);
+        if (extra) {
+          row.dataset.keyRef = r.extra_key.ref;
+          input.placeholder = r.extra_key.preview;
+        } else {
+          input.placeholder = r.preview;
+          if (r.chat?.length) {
+            const sel = root.querySelector('#llmm');
+            if (sel?.tagName === 'SELECT') sel.innerHTML = opt(r.chat, sel.value);
+          }
+        }
+      } catch (err) {
+        feedback(err.message, false);
+      } finally {
+        test.textContent = 'Test key';
+        input.disabled = test.disabled = false;
+        if (remove) remove.disabled = false;
+        saveBtn.disabled = --pendingKeyTests > 0;
+      }
+    };
+  };
+  root.querySelectorAll('.groq-key-field').forEach(wireKey);
+  root.querySelector('#addkey').onclick = () => {
+    extraBox.insertAdjacentHTML('beforeend',
+      keyField(`groq-key-${nextKeyId++}`, 'Extra Groq API key', '', ''));
+    const row = extraBox.lastElementChild;
+    wireKey(row);
+    row.querySelector('input').focus();
+  };
+
   const prov = root.querySelector('#prov');
   const speed = root.querySelector('#speed');
   const gain = root.querySelector('#gain');
-
-  /* show / hide the key */
-  root.querySelector('#showkey').onclick = (e) => {
-    e.preventDefault();
-    keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
-  };
-
-  /* validate the key against Groq before committing to it */
-  root.querySelector('#testkey').onclick = async (e) => {
-    e.preventDefault();
-    const btn = e.target;
-    btn.disabled = true; btn.textContent = 'Testing...';
-    keyResult.innerHTML = '';
-    try {
-      const r = await jsonPost('/api/settings/test-key',
-        { groq_api_key: keyInput.value.trim(), save: true });
-      keyResult.innerHTML = `<div class="alert ${r.ok ? 'info' : ''}"
-        style="margin:10px 0 0">${esc(r.detail)}</div>`;
-      if (r.ok) {
-        keyInput.value = '';
-        keyInput.placeholder = 'saved';
-        toast('API key verified and saved');
-        if (r.chat?.length) {
-          const sel = root.querySelector('#llmm');
-          if (sel?.tagName === 'SELECT') {
-            sel.innerHTML = r.chat.map((m) =>
-              `<option value="${esc(m)}"${m === cfg.llm_model ? ' selected' : ''}>${esc(m)}</option>`).join('');
-          }
-        }
-      }
-    } catch (err) {
-      keyResult.innerHTML = `<div class="alert" style="margin:10px 0 0">${esc(err.message)}</div>`;
-    }
-    btn.disabled = false; btn.textContent = 'Test key';
-  };
 
   /* provider switch - probe LM Studio only when it is actually selected */
   let localProbed = false;
@@ -845,13 +828,14 @@ async function fillSettings(root) {
   };
 
   saveBtn.onclick = async () => {
+    if (pendingKeyTests || savingSettings) return;
+    savingSettings = true;
     saveBtn.disabled = true; saveBtn.textContent = 'Saving...';
     const payload = {
       asr_model: root.querySelector('#asrm').value,
       llm_provider: prov.value,
       llm_model: root.querySelector('#llmm').value,
       llm_helpers: helpers(),
-      groq_api_keys: extraKeys(),
       local_model: root.querySelector('#localm')?.value || '',
       voice: root.querySelector('#voice').value,
       ...getTune(),
@@ -863,12 +847,14 @@ async function fillSettings(root) {
     };
     const key = keyInput.value.trim();
     if (key) payload.groq_api_key = key;
+    if (extraKeysEdited) payload.groq_extra_keys = extraKeys();
     try {
       const saved = await jsonPost('/api/settings', payload);
       closeModal();
       toast(saved.has_key ? 'Settings saved' : 'Settings saved - no API key yet');
     } catch (err) {
       toast(err.message, true);
+      savingSettings = false;
       saveBtn.disabled = false; saveBtn.textContent = 'Save settings';
     }
   };

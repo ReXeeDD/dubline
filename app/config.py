@@ -14,11 +14,12 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
+INSTALL_DIR = Path(os.environ.get("DUBLINE_INSTALL_DIR", ROOT)).resolve()
+DATA = INSTALL_DIR / "data"
 LIBRARY = DATA / "library"
 TMP = DATA / "tmp"
 CACHE = DATA / "cache"
-BIN = ROOT / "bin"
+BIN = INSTALL_DIR / "bin"
 SETTINGS_FILE = DATA / "settings.json"
 # Second copy of the API key. If settings.json is ever deleted or corrupted the
 # key is recovered from here instead of having to be pasted again.
@@ -128,12 +129,22 @@ def load_settings() -> dict:
     return cfg
 
 
+def _write_json(path: Path, data: dict) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as pending:
+        temporary = Path(pending.name)
+    try:
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def save_settings(patch: dict) -> dict:
     cfg = load_settings()
     for k, v in patch.items():
         if k in DEFAULTS:
             cfg[k] = v
-    SETTINGS_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    _write_json(SETTINGS_FILE, cfg)
     cache_credentials(cfg.get("groq_api_key", ""))
     return cfg
 
@@ -143,9 +154,7 @@ def cache_credentials(api_key: str) -> None:
     if not api_key:
         return
     CACHE.mkdir(parents=True, exist_ok=True)
-    CRED_CACHE.write_text(
-        json.dumps({"groq_api_key": api_key, "saved_at": time.time()}, indent=2),
-        encoding="utf-8")
+    _write_json(CRED_CACHE, {"groq_api_key": api_key, "saved_at": time.time()})
     try:  # best effort on Windows; owner-only where the OS supports it
         CRED_CACHE.chmod(0o600)
     except Exception:
@@ -167,37 +176,32 @@ def key_locations() -> dict:
 _BIN_CACHE: dict[str, str] = {}
 _EXE = ".exe" if os.name == "nt" else ""
 
-# BtbN's static Windows builds: one zip with both binaries, no installer.
-FFMPEG_ZIP = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-              "ffmpeg-master-latest-win64-gpl.zip")
-
-
-def _probe(path: str) -> bool:
+def ffmpeg_executable_works(path: str | Path) -> bool:
     try:
-        subprocess.run([path, "-version"], capture_output=True, timeout=20)
+        subprocess.run([path, "-version"], capture_output=True, timeout=20, check=True)
         return True
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
 def _resolve(name: str) -> str:
     """Prefer our own bin/ on D:, then PATH. Never installs into C:."""
-    if name in _BIN_CACHE:
+    if name in _BIN_CACHE and Path(_BIN_CACHE[name]).is_file():
         return _BIN_CACHE[name]
 
     local = BIN / f"{name}{_EXE}"
-    if local.exists() and _probe(str(local)):
+    if local.is_file() and ffmpeg_executable_works(local):
         _BIN_CACHE[name] = str(local)
         return str(local)
 
     found = shutil.which(name)
-    if found and _probe(found):
+    if found and ffmpeg_executable_works(found):
         _BIN_CACHE[name] = found
         return found
 
     raise RuntimeError(
-        f"{name} is not installed. Run:  python setup.py\n"
-        f"That downloads ffmpeg into {BIN} (about 80 MB, stays on D:)."
+        f"No working {name} executable found in {BIN} or on PATH.\n"
+        "Run:  python setup.py"
     )
 
 
@@ -214,5 +218,5 @@ def ffmpeg_ready() -> bool:
         _resolve("ffmpeg")
         _resolve("ffprobe")
         return True
-    except Exception:
+    except RuntimeError:
         return False

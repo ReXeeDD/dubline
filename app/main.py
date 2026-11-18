@@ -1,11 +1,14 @@
 """FastAPI app: upload, process, browse and play dubbed videos."""
 from __future__ import annotations
 
+import hmac
 import mimetypes
 import re
+import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, Response,
@@ -537,52 +540,136 @@ def api_voice_preview(body: dict):
     return Response(data, media_type="audio/mpeg")
 
 
+_SETTINGS_LOCK = Lock()
+_KEY_REF_SECRET = secrets.token_bytes(32)
+
+
+def _key_preview(key: str) -> str:
+    return key[:4] + "..." + key[-4:] if len(key) > 12 else "..." if key else ""
+
+
+def _extra_key_view(key: str) -> dict[str, str]:
+    ref = hmac.digest(_KEY_REF_SECRET, key.encode("utf-8"), "sha256").hex()
+    return {"ref": ref, "preview": _key_preview(key)}
+
+
+def _saved_extra_keys(cfg: dict) -> dict[str, str]:
+    return {_extra_key_view(key)["ref"]: key for key in (cfg.get("groq_api_keys") or []) if key}
+
+
+def _resolve_extra_key(ref: str, saved: dict[str, str]) -> str:
+    if ref not in saved:
+        raise HTTPException(409, "Saved keys changed. Reopen Settings and try again.")
+    return saved[ref]
+
+
+def _legacy_extra_key(preview: str, saved: dict[str, str]) -> str:
+    matches = [key for key in saved.values() if _key_preview(key) == preview]
+    if len(matches) != 1:
+        raise HTTPException(409, "Could not identify the saved key. Reopen Settings and try again.")
+    return matches[0]
+
+
+def _verify_extra_key(key: str) -> dict:
+    result = llm.verify_key(key)
+    if result["ok"] and not result["chat"]:
+        return {"ok": False, "detail": "This key has no available chat models for translation."}
+    return result
+
+
 @app.get("/api/settings")
 def api_get_settings():
     cfg = load_settings()
     key = cfg.get("groq_api_key") or ""
-    cfg["groq_api_key"] = (key[:4] + "..." + key[-4:]) if len(key) > 12 else ""
+    cfg["groq_api_key"] = _key_preview(key)
     cfg["has_key"] = bool(key)
-    # Extra keys are masked the same way. Sending them back in full would put
-    # someone else's credential into the page for no reason.
-    cfg["groq_api_keys"] = [(k[:4] + "..." + k[-4:]) if len(k) > 12 else ""
-                            for k in (cfg.get("groq_api_keys") or [])]
+    extras = [_extra_key_view(k) for k in _saved_extra_keys(cfg).values()]
+    cfg["groq_api_keys"] = [entry["preview"] for entry in extras]
+    cfg["groq_extra_keys"] = extras
     cfg["key_storage"] = key_locations()
     return cfg
 
 
 @app.post("/api/settings")
 def api_set_settings(body: dict):
-    if "groq_api_key" in body and "..." in str(body["groq_api_key"]):
-        body.pop("groq_api_key")     # masked value echoed back - leave it alone
-
-    # Same for the extras, but position matters: a masked entry means "keep the
-    # key that was in this slot", so the stored list is matched up by index.
-    if "groq_api_keys" in body:
-        stored = load_settings().get("groq_api_keys") or []
-        kept = []
-        for i, k in enumerate(body["groq_api_keys"] or []):
-            k = str(k or "").strip()
-            if "..." in k:
-                k = stored[i] if i < len(stored) else ""
-            if k:
-                kept.append(k)
-        body["groq_api_keys"] = kept
-
-    save_settings(body)
-    return api_get_settings()
+    if "groq_api_key" in body:
+        if not isinstance(body["groq_api_key"], str):
+            raise HTTPException(422, "Enter the Groq API key as text.")
+        body["groq_api_key"] = body["groq_api_key"].strip()
+        if "..." in body["groq_api_key"]:
+            body.pop("groq_api_key")
+    with _SETTINGS_LOCK:
+        if "groq_extra_keys" in body or "groq_api_keys" in body:
+            cfg = load_settings()
+            saved = _saved_extra_keys(cfg)
+            entries = body.pop("groq_extra_keys", body.get("groq_api_keys")) or []
+            if not isinstance(entries, list):
+                raise HTTPException(422, "Extra keys must be a list.")
+            primary = str(body.get("groq_api_key", cfg.get("groq_api_key")) or "").strip()
+            seen = {primary}
+            kept = []
+            for i, entry in enumerate(entries, start=2):
+                if isinstance(entry, dict):
+                    if "key" in entry:
+                        key = str(entry["key"] or "").strip()
+                    else:
+                        key = _resolve_extra_key(str(entry.get("ref") or ""), saved)
+                elif isinstance(entry, str):
+                    key = _legacy_extra_key(entry, saved) if "..." in entry else entry.strip()
+                else:
+                    raise HTTPException(422, f"API key {i} has an invalid entry.")
+                if not key:
+                    continue
+                if key in seen:
+                    raise HTTPException(422, f"API key {i} is already listed.")
+                if key not in saved.values():
+                    result = _verify_extra_key(key)
+                    if not result["ok"]:
+                        raise HTTPException(422, f"API key {i}: {result['detail']}")
+                seen.add(key)
+                kept.append(key)
+            body["groq_api_keys"] = kept
+        elif body.get("groq_api_key") in _saved_extra_keys(load_settings()).values():
+            raise HTTPException(422, "This key is already listed as an extra key.")
+        save_settings(body)
+        return api_get_settings()
 
 
 @app.post("/api/settings/test-key")
 def api_test_key(body: dict):
-    """Validate a key against Groq. Saves it only if it works."""
+    """Verify the selected key, and optionally save it in the same slot."""
+    cfg = load_settings()
+    ref = str(body.get("extra_key_ref") or "")
+    extra = bool(body.get("extra") or ref)
     key = str(body.get("key") or body.get("groq_api_key") or "").strip()
-    if not key or "..." in key:
-        key = load_settings().get("groq_api_key", "")
-    result = llm.verify_key(key)
+    if extra and not key and ref:
+        key = _resolve_extra_key(ref, _saved_extra_keys(cfg))
+    elif not extra and "key" in body:
+        if "..." in key:
+            key = _legacy_extra_key(key, _saved_extra_keys(cfg))
+    elif not extra and (not key or "..." in key):
+        key = cfg.get("groq_api_key", "")
+    result = _verify_extra_key(key) if extra else llm.verify_key(key)
     if result["ok"] and body.get("save"):
-        save_settings({"groq_api_key": key})
-        result["storage"] = key_locations()
+        with _SETTINGS_LOCK:
+            if extra:
+                cfg = load_settings()
+                saved = _saved_extra_keys(cfg)
+                existing = _resolve_extra_key(ref, saved) if ref else None
+                if key == cfg.get("groq_api_key") or (key in saved.values() and key != existing):
+                    raise HTTPException(422, "This key is already listed.")
+                keys = [key if value == existing else value for value in saved.values()]
+                if not ref:
+                    keys.append(key)
+                if key != existing:
+                    save_settings({"groq_api_keys": keys})
+                result["extra_key"] = _extra_key_view(key)
+            else:
+                if key in _saved_extra_keys(load_settings()).values():
+                    raise HTTPException(422, "This key is already listed as an extra key.")
+                save_settings({"groq_api_key": key})
+                result["preview"] = _key_preview(key)
+                result["storage"] = key_locations()
     return result
 
 
@@ -607,11 +694,12 @@ def api_models(local: int = 0):
 
 @app.get("/api/health")
 def api_health():
-    from .config import ffmpeg
+    from .config import ffmpeg, ffprobe
 
     out = {"ffmpeg": False, "groq_key": bool(load_settings().get("groq_api_key"))}
     try:
         ffmpeg()
+        ffprobe()
         out["ffmpeg"] = True
     except Exception as e:
         out["ffmpeg_error"] = str(e)

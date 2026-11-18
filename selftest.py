@@ -1,4 +1,4 @@
-"""Offline self-test: exercises everything except the Groq API calls.
+"""Self-test that runs without a Groq API key.
 
 Builds a synthetic video, runs the TTS + alignment + mux stages on scripted
 segments, and checks that the dubbed audio actually lands on the right
@@ -904,7 +904,7 @@ def _download_checks() -> None:
           download._explain("Video unavailable", {}) == "Video unavailable")
 
 
-def main() -> None:
+def main() -> int:
     if WORK.exists():
         shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True, exist_ok=True)
@@ -935,7 +935,7 @@ def main() -> None:
         print(f"       using {voice}")
     except Exception as e:
         check("voices loaded", False, str(e))
-        return
+        return 1
 
     # ------------------------------------------------- synthesis + alignment --
     print("\n3. Synthesising speech and aligning it to the timeline")
@@ -1049,8 +1049,10 @@ def main() -> None:
     print("  RESULT:", "ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")
     print(f"  Listen to the result: {out}")
     print("=" * 62)
-    sys.exit(0 if ok else 1)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    # Keep the console or redirect's encoding, escaping unsupported characters.
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.exit(main())
