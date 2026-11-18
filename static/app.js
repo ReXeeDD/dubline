@@ -873,7 +873,7 @@ function card(v) {
             || v.status === 'downloading';
   const thumb = v.has_thumb
     ? `<img src="/media/${v.id}/thumb.jpg" alt="" loading="lazy">`
-    : `<div style="color:var(--text-3);font-size:32px">🎬</div>`;
+    : `<img src="/static/dubline-waveform.png" alt="" style="width:32px;height:32px;object-fit:contain">`;
 
   const meta = v.status === 'ready'
     ? `${v.line_count} lines &middot; ${esc(v.voice ? v.voice.split('-').pop().replace('Neural', '') : '')} &middot; ${ago(v.created_at)}`
